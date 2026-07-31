@@ -1,13 +1,15 @@
 # bench — évaluation d'un LLM sur du code Rust et Python
 
-Harnais d'évaluation qui fait écrire du code à un modèle (local via Ollama, ou
-Claude via le CLI) et note le résultat avec une **suite de tests cachée** que le
-modèle ne voit jamais. Deux langages, deux modes, 9 tâches, 150 tests.
+Harnais d'évaluation qui fait écrire du code à un modèle (local via Ollama,
+n'importe quel fournisseur via LiteLLM, ou Claude via le CLI) et note le résultat
+avec une **suite de tests cachée** que le modèle ne voit jamais. Deux langages,
+deux modes, 9 tâches, 150 tests.
 
 ## Installation
 
-Rien à installer : Python 3 (bibliothèque standard uniquement), `cargo`, et un
-Ollama qui tourne.
+Rien à installer côté harnais : Python 3 (bibliothèque standard uniquement) et
+`cargo`. Puis, selon le backend visé, un Ollama qui tourne, un proxy LiteLLM
+joignable, ou le CLI `claude`.
 
 ## Utilisation
 
@@ -23,10 +25,20 @@ python3 bench.py --models gemma4:31b-mlx,qwen3.6:35b-mlx --tasks rle,lru --modes
 
 # 4. comparer un modèle local à Claude via le CLI Claude Code (auth abonnement)
 python3 bench.py --models qwen3.6:35b-a3b-coding-mxfp8,claude:opus
+
+# 5. passer par un proxy LiteLLM (n'importe quel fournisseur qu'il route)
+python3 bench.py --models litellm:gpt-4o-mini,litellm:claude-sonnet-5 \
+                 --litellm-base-url http://localhost:4000
 ```
 
-Un nom nu désigne un modèle **Ollama**. Le préfixe `claude:` route vers le
-**CLI Claude Code** (`claude:opus`, `claude:sonnet`, `claude:claude-opus-5`).
+| préfixe | backend |
+|---|---|
+| *(aucun)* ou `ollama:` | modèle **Ollama** local, API native |
+| `litellm:` | endpoint **OpenAI-compatible** : proxy LiteLLM, ou tout `/v1/chat/completions` |
+| `claude:` | **CLI Claude Code** (`claude:opus`, `claude:sonnet`, `claude:claude-opus-5`) |
+
+`--backend litellm` change le backend des noms sans préfixe, pour ne pas préfixer
+toute une liste.
 
 Sélection des tâches : `--lang rust` ou `--lang python` pour une série entière,
 `--tasks` pour un sous-ensemble (`rle` prend les deux langages, `python/asn1_ber`
@@ -57,9 +69,14 @@ Options utiles :
 | `--task-timeout` | `600` | budget en secondes par couple (tâche, mode) ; **au-delà on tue** |
 | `--cargo-timeout` | `120` | budget par commande cargo |
 | `--max-turns` | `12` | tours maximum en mode agentique |
-| `--num-ctx` | `16384` | fenêtre de contexte Ollama |
+| `--num-ctx` | `16384` | fenêtre de contexte Ollama (sans effet sur `litellm:`) |
 | `--temperature` / `--seed` | `0.2` / `0` | reproductibilité |
 | `--agent-protocol` | `auto` | `tools` (tool-calling natif), `text` (protocole textuel), `auto` bascule si le modèle ne supporte pas les outils |
+| `--backend` | `ollama` | backend des modèles sans préfixe |
+| `--litellm-base-url` | `$LITELLM_BASE_URL`, sinon `http://localhost:4000` | endpoint OpenAI-compatible |
+| `--litellm-api-key` | `$LITELLM_API_KEY`, sinon `$OPENAI_API_KEY` | envoyée en `Authorization: Bearer` |
+| `--litellm-extra-body` | — | JSON fusionné dans chaque requête, ex. `'{"num_ctx": 16384}'` |
+| `--no-warmup` | — | saute l'appel de préchauffage (inutile et facturé sur une API distante) |
 
 ## Les deux modes
 
@@ -79,6 +96,38 @@ boucle de correction, aucun compilateur. Mesure la justesse « du premier coup �
 Il boucle donc écrire → compiler → lire les erreurs → corriger, jusqu'à `finish`
 ou épuisement des tours. Il peut écrire **ses propres** tests, ce qui n'influence
 pas la note : la note vient toujours des tests cachés.
+
+## Backend `litellm:`
+
+Le client parle le dialecte **OpenAI en streaming** (`POST /v1/chat/completions`,
+`stream: true`) : il marche avec un proxy LiteLLM, mais aussi avec n'importe quel
+endpoint compatible. C'est le même harnais que pour Ollama — mêmes prompts,
+mêmes quatre outils, même boucle agentique — seul le transport change ; **les
+deux modes restent donc comparables** avec les lignes Ollama.
+
+```bash
+# le proxy en face, avec ta config de routage
+litellm --config config.yaml            # écoute sur :4000
+
+export LITELLM_API_KEY=sk-...           # ou --litellm-api-key
+python3 bench.py --models litellm:gpt-4o-mini --no-warmup
+```
+
+Ce qui est repris du backend Ollama : streaming (couper la connexion arrête la
+génération côté serveur, donc le budget `--task-timeout` est vraiment tenu),
+tool-calling natif, bascule `auto` vers le protocole texte si le modèle refuse
+les outils, tokens et coût quand le proxy les renvoie (usage de fin de flux,
+en-tête `x-litellm-response-cost`).
+
+Trois réserves :
+
+- **`tok/s`** est mesuré du premier au dernier token, **réseau compris**, alors
+  qu'Ollama expose son décodage pur (`eval_count / eval_duration`). Sur un
+  endpoint distant, la latence du réseau est dans le dénominateur.
+- **Les paramètres d'inférence appartiennent au serveur** derrière le proxy
+  (quantisation, contexte, batching) : `--num-ctx` ne s'y applique pas. Utiliser
+  `--litellm-extra-body '{"num_ctx": 16384}'` si le backend accepte le paramètre.
+- **`--seed` n'est qu'une intention** : peu de fournisseurs le garantissent.
 
 ## Backend `claude:` — et ce qu'il ne prouve pas
 
@@ -187,8 +236,8 @@ modèle dans un **projet neuf**, y injecte `tests/hidden.rs`, et lance
 | `fail` | ça compile, des tests échouent (score partiel = passés/total) |
 | `compile_error` | ça ne compile pas → 0 |
 | `no_code` | le modèle n'a rendu aucun code exploitable → 0 |
-| `timeout` | budget dépassé, génération et processus tués |
-| `error` | Ollama injoignable, modèle inconnu, etc. |
+| `timeout` | budget dépassé, ou flux coupé côté serveur ; génération et processus tués |
+| `error` | backend injoignable, modèle inconnu, refus de l'API, etc. |
 
 ## Mesures collectées
 
@@ -197,14 +246,17 @@ Par couple (modèle, tâche, mode) :
 - **exactitude** : statut, tests passés / total, score
 - **temps** : mur total, temps passé dans le LLM, temps passé dans cargo,
   time-to-first-token
-- **tokens** : prompt, générés, tok/s réels (`eval_count / eval_duration`
-  remontés par Ollama, donc hors chargement du modèle)
+- **tokens** : prompt, générés, tok/s — décodage pur côté Ollama
+  (`eval_count / eval_duration`, donc hors chargement du modèle), fenêtre
+  premier → dernier token réseau compris côté `litellm:`
 - **comportement agentique** : tours, appels d'outils, écritures, commandes
   cargo, actions malformées, est-ce que ses propres tests passaient
 - **code** : lignes non vides produites
 
 Le modèle est préchargé (warm-up) avant la première tâche pour que le temps de
-chargement des poids ne pollue pas les mesures.
+chargement des poids ne pollue pas les mesures. Sur un backend `litellm:` le
+warm-up ne sert plus qu'à valider tôt l'endpoint et la clé — `--no-warmup` le
+supprime si l'appel est facturé.
 
 ## Sorties
 
@@ -229,7 +281,12 @@ fait rien perdre.
   réelle, augmente le nombre de tâches ou refais tourner avec d'autres `--seed`
   pour conclure sérieusement.
 - Un timeout en cours de génération coupe la connexion HTTP, ce qui arrête
-  Ollama côté serveur ; le modèle reste chargé (`keep_alive`).
+  Ollama côté serveur ; le modèle reste chargé (`keep_alive`). Derrière un proxy
+  LiteLLM, l'arrêt effectif dépend du fournisseur : la requête peut être
+  facturée entièrement même si on raccroche.
+- Le timeout HTTP est un timeout **de lecture** (120 s max entre deux blocs) :
+  un serveur muet plus longtemps que ça est signalé `timeout` avec la raison
+  exacte, même si le budget global n'est pas épuisé.
 - La sandbox est volontairement minimale (allowlist de chemins et de commandes
   cargo) : c'est une barrière contre les dérapages, pas contre un modèle
   hostile.

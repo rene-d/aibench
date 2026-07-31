@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Benchmark d'un LLM local (Ollama) ou de Claude sur des tâches de codage,
-en Rust et en Python.
+Benchmark de LLM sur des tâches de codage, en Rust et en Python.
+
+Trois backends :
+  - Ollama          : modèle local, API native (nom nu, ou préfixe `ollama:`).
+  - LiteLLM         : proxy ou endpoint OpenAI-compatible (préfixe `litellm:`),
+                      donc n'importe quel fournisseur routé par LiteLLM.
+  - Claude Code CLI : préfixe `claude:`, auth par abonnement.
 
 Deux modes d'évaluation :
   - direct    : un seul appel, le modèle rend le fichier d'un coup (pass@1).
@@ -14,6 +19,7 @@ modèle ne voit jamais, exécutée dans une copie propre du projet.
 Usage :
     python3 bench.py --self-test
     python3 bench.py --models qwen3.6:35b-mlx
+    python3 bench.py --models litellm:gpt-4o-mini --litellm-base-url http://localhost:4000
     python3 bench.py --models claude:opus --lang python
     python3 bench.py --models a,b --tasks rust/rle,python/asn1_ber --modes direct
 """
@@ -21,6 +27,7 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -122,15 +129,23 @@ def run_cmd(argv: list[str], cwd: Path, timeout: float, env: dict | None = None)
 
 
 # --------------------------------------------------------------------------- #
-# Client Ollama (streaming, pour pouvoir couper net sur deadline)
+# Clients LLM (streaming, pour pouvoir couper net sur deadline)
 # --------------------------------------------------------------------------- #
 
 
-class OllamaError(RuntimeError):
+class LlmError(RuntimeError):
     pass
 
 
-class ToolsUnsupported(OllamaError):
+class OllamaError(LlmError):
+    pass
+
+
+class LiteLLMError(LlmError):
+    pass
+
+
+class ToolsUnsupported(LlmError):
     pass
 
 
@@ -145,7 +160,29 @@ class LlmReply:
     load_s: float = 0.0
     wall_s: float = 0.0
     ttft_s: float = 0.0
+    cost_usd: float = 0.0
     aborted: bool = False
+    abort_reason: str = ""
+
+
+def read_timeout(budget: float) -> float:
+    """Timeout *de lecture* d'un flux : il s'applique à chaque bloc reçu."""
+    return max(5.0, min(budget, 120.0))
+
+
+def note_abort(reply: LlmReply, exc: BaseException, timeout: float) -> None:
+    """Flux coupé : on garde ce qui est déjà arrivé et on dit pourquoi.
+
+    Le timeout d'`urlopen` étant un timeout de lecture, un serveur qui met trop
+    longtemps à sortir le token suivant lève TimeoutError ici, au milieu de
+    l'itération sur la réponse — pas au moment de la requête.
+    """
+    reply.aborted = True
+    if isinstance(exc, TimeoutError):
+        reply.abort_reason = (f"aucune donnée du serveur pendant {timeout:.0f}s "
+                              f"(timeout de lecture)")
+    else:
+        reply.abort_reason = f"flux interrompu : {type(exc).__name__}: {exc}"
 
 
 class Ollama:
@@ -179,8 +216,9 @@ class Ollama:
 
         reply = LlmReply()
         t0 = time.monotonic()
+        timeout = read_timeout(budget)
         try:
-            resp = urllib.request.urlopen(req, timeout=max(5.0, min(budget, 120.0)))
+            resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="replace")
             if "does not support tools" in body or "tools" in body and exc.code == 400:
@@ -188,6 +226,10 @@ class Ollama:
             raise OllamaError(f"HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
             raise OllamaError(f"Ollama injoignable sur {self.host} : {exc}") from exc
+        except TimeoutError as exc:
+            raise OllamaError(f"Ollama n'a pas répondu en {timeout:.0f}s : {exc}") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            raise OllamaError(f"Ollama {self.host} : {type(exc).__name__}: {exc}") from exc
 
         try:
             for raw in resp:
@@ -221,6 +263,8 @@ class Ollama:
                     reply.gen_tokens = chunk.get("eval_count", 0) or 0
                     reply.eval_s = (chunk.get("eval_duration", 0) or 0) / 1e9
                     reply.load_s = (chunk.get("load_duration", 0) or 0) / 1e9
+        except (TimeoutError, http.client.IncompleteRead, OSError) as exc:
+            note_abort(reply, exc, timeout)
         finally:
             resp.close()  # couper la connexion arrête la génération côté serveur
 
@@ -232,6 +276,210 @@ class Ollama:
         t0 = time.monotonic()
         self.chat(model, [{"role": "user", "content": "ok"}], None, budget=180.0)
         return time.monotonic() - t0
+
+    # --- mise en forme des messages de la boucle agentique ------------------ #
+
+    def assistant_msg(self, reply: LlmReply) -> dict:
+        msg = {"role": "assistant", "content": reply.content}
+        if reply.tool_calls:
+            msg["tool_calls"] = reply.tool_calls[:1]
+        return msg
+
+    def tool_msg(self, call: dict, name: str, output: str) -> dict:
+        return {"role": "tool", "content": output,
+                "tool_name": (call.get("function") or {}).get("name") or name}
+
+
+class LiteLLM:
+    """Client OpenAI-compatible : proxy LiteLLM, ou tout endpoint `/chat/completions`.
+
+    Même interface que `Ollama` (chat / warmup rendant un `LlmReply`), ce qui
+    permet de réutiliser tels quels les modes direct et agentique.
+
+    Deux différences de mesure à garder en tête :
+      - pas de temps de décodage pur exposé par l'API : `eval_s` est la fenêtre
+        premier token → dernier token, réseau compris. Ce n'est PAS la même
+        définition que le `eval_duration` d'Ollama ;
+      - `load_s` n'a pas de sens ici (rien à charger côté client).
+    """
+
+    def __init__(self, base_url: str, api_key: str, temperature: float, seed: int,
+                 extra_body: dict | None = None):
+        url = base_url.rstrip("/")
+        if not url.startswith("http"):
+            url = "http://" + url
+        # Le proxy LiteLLM sert les deux, mais /v1 est ce qu'attendent aussi les
+        # endpoints OpenAI-compatibles tiers.
+        self.base_url = url if url.endswith("/v1") else url + "/v1"
+        self.api_key = api_key
+        self.temperature = temperature
+        self.seed = seed
+        self.extra_body = extra_body or {}
+
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def _post(self, path: str, payload: dict, timeout: float):
+        """POST streamé. `timeout` est un timeout de lecture, pas un budget total."""
+        req = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode(),
+            headers=self._headers(),
+        )
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")
+            low = body.lower()
+            if exc.code in (400, 404, 422) and (
+                    "tool" in low or "function call" in low) and "tool_call_id" not in low:
+                raise ToolsUnsupported(body) from exc
+            raise LiteLLMError(f"HTTP {exc.code}: {body[:800]}") from exc
+        except urllib.error.URLError as exc:
+            raise LiteLLMError(f"endpoint LiteLLM injoignable sur {self.base_url} : {exc}") from exc
+        except TimeoutError as exc:
+            raise LiteLLMError(
+                f"{self.base_url} n'a pas répondu en {timeout:.0f}s : {exc}") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            # connexion coupée par le proxy, réponse tronquée… : ne doit pas
+            # faire tomber le run entier, juste marquer ce couple (tâche, mode).
+            raise LiteLLMError(f"{self.base_url} : {type(exc).__name__}: {exc}") from exc
+
+    def chat(self, model: str, messages: list, tools: list | None, budget: float) -> LlmReply:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            # sans ça, la plupart des backends omettent l'usage en streaming
+            "stream_options": {"include_usage": True},
+            "temperature": self.temperature,
+        }
+        if self.seed:
+            payload["seed"] = self.seed
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        payload.update(self.extra_body)
+
+        reply = LlmReply()
+        t0 = time.monotonic()
+        timeout = read_timeout(budget)
+        try:
+            resp = self._post("/chat/completions", payload, timeout)
+        except LiteLLMError as exc:
+            if "stream_options" not in str(exc):
+                raise
+            # backend qui ne connaît pas l'option : on repart sans, quitte à
+            # perdre le compte de tokens.
+            payload.pop("stream_options")
+            resp = self._post("/chat/completions", payload, timeout)
+        # Coût annoncé par le proxy quand il le connaît d'avance ; sinon il peut
+        # encore arriver dans l'`usage` de fin de flux (voir plus bas).
+        reply.cost_usd = _float_header(resp, "x-litellm-response-cost")
+
+        calls: dict[int, dict] = {}
+        t_last = 0.0
+        try:
+            for raw in resp:
+                if time.monotonic() - t0 > budget:
+                    reply.aborted = True
+                    break
+                line = raw.decode(errors="replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(chunk, dict) and chunk.get("error"):
+                    err = chunk["error"]
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    if "tool" in str(msg).lower():
+                        raise ToolsUnsupported(str(msg))
+                    raise LiteLLMError(str(msg))
+
+                usage = chunk.get("usage") or {}
+                if usage:
+                    reply.prompt_tokens = usage.get("prompt_tokens", 0) or reply.prompt_tokens
+                    reply.gen_tokens = usage.get("completion_tokens", 0) or reply.gen_tokens
+                    reply.cost_usd = reply.cost_usd or float(usage.get("cost") or 0.0)
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content") or ""
+                thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                if piece or thought:
+                    now = time.monotonic() - t0
+                    if not reply.ttft_s:
+                        reply.ttft_s = now
+                    t_last = now
+                reply.content += piece
+                reply.thinking += thought
+
+                for frag in delta.get("tool_calls") or []:
+                    idx = frag.get("index")
+                    if idx is None:
+                        idx = len(calls)
+                    slot = calls.setdefault(idx, {"id": "", "type": "function",
+                                                  "function": {"name": "", "arguments": ""}})
+                    if frag.get("id"):
+                        slot["id"] = frag["id"]
+                    fn = frag.get("function") or {}
+                    if fn.get("name") and not slot["function"]["name"]:
+                        slot["function"]["name"] = fn["name"]
+                    # les arguments arrivent en morceaux de JSON à recoller
+                    slot["function"]["arguments"] += fn.get("arguments") or ""
+                    if not reply.ttft_s:
+                        reply.ttft_s = time.monotonic() - t0
+                    t_last = time.monotonic() - t0
+        except (TimeoutError, http.client.IncompleteRead, OSError) as exc:
+            note_abort(reply, exc, timeout)
+        finally:
+            resp.close()  # couper la connexion arrête la génération côté serveur
+
+        reply.tool_calls = [calls[k] for k in sorted(calls)]
+        reply.wall_s = time.monotonic() - t0
+        # fenêtre de décodage observée ; à défaut, le temps hors TTFT
+        reply.eval_s = max(t_last - reply.ttft_s, 0.0) or max(reply.wall_s - reply.ttft_s, 0.0)
+        # gen_tokens reste à 0 si le backend n'a pas renvoyé d'usage : mieux vaut
+        # une colonne vide qu'une estimation inventée dans un benchmark.
+        return reply
+
+    def warmup(self, model: str) -> float:
+        """Vérifie tôt que l'endpoint répond et que le modèle existe."""
+        t0 = time.monotonic()
+        self.chat(model, [{"role": "user", "content": "ok"}], None, budget=60.0)
+        return time.monotonic() - t0
+
+    # --- mise en forme des messages de la boucle agentique ------------------ #
+
+    def assistant_msg(self, reply: LlmReply) -> dict:
+        msg = {"role": "assistant"}
+        if reply.content or not reply.tool_calls:
+            msg["content"] = reply.content
+        if reply.tool_calls:
+            msg["tool_calls"] = reply.tool_calls[:1]
+        return msg
+
+    def tool_msg(self, call: dict, name: str, output: str) -> dict:
+        return {"role": "tool", "content": output,
+                "tool_call_id": call.get("id") or name}
+
+
+def _float_header(resp, name: str) -> float:
+    try:
+        return float(resp.headers.get(name) or 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -575,14 +823,15 @@ def direct_messages(task: Task) -> tuple[str, str]:
     )
 
 
-def run_direct(client: Ollama, model: str, task: Task, workdir: Path,
-               target_dir: Path, deadline: Deadline, cargo_timeout: float) -> "Result":
-    res = Result(model=model, task=task.key, mode="direct", protocol="single-shot")
+def run_direct(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
+               target_dir: Path, deadline: Deadline, cargo_timeout: float,
+               label: str = "") -> "Result":
+    res = Result(model=label or model, task=task.key, mode="direct", protocol="single-shot")
     system, user = direct_messages(task)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     try:
         reply = client.chat(model, messages, None, budget=deadline.remaining)
-    except OllamaError as exc:
+    except LlmError as exc:
         res.status = "error"
         res.detail = str(exc)[:500]
         res.wall_s = deadline.elapsed
@@ -594,7 +843,8 @@ def run_direct(client: Ollama, model: str, task: Task, workdir: Path,
 
     if reply.aborted or deadline.expired:
         res.status = "timeout"
-        res.detail = f"budget de {deadline.limit:.0f}s dépassé pendant la génération"
+        res.detail = (reply.abort_reason
+                      or f"budget de {deadline.limit:.0f}s dépassé pendant la génération")
         res.wall_s = deadline.elapsed
         return res
 
@@ -811,10 +1061,10 @@ def parse_text_action(text: str, lang: Lang) -> tuple[str, dict]:
     return "", {}
 
 
-def run_agentic(client: Ollama, model: str, task: Task, workdir: Path, target_dir: Path,
-                deadline: Deadline, cargo_timeout: float, max_turns: int,
-                protocol: str) -> "Result":
-    res = Result(model=model, task=task.key, mode="agentic", protocol=protocol)
+def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
+                target_dir: Path, deadline: Deadline, cargo_timeout: float, max_turns: int,
+                protocol: str, label: str = "") -> "Result":
+    res = Result(model=label or model, task=task.key, mode="agentic", protocol=protocol)
     lang = task.lang
     project = workdir / "agent"
     lang.scaffold(project, "")
@@ -852,7 +1102,7 @@ def run_agentic(client: Ollama, model: str, task: Task, workdir: Path, target_di
             res.status = "error"
             res.detail = "le modèle ne supporte pas les outils"
             break
-        except OllamaError as exc:
+        except LlmError as exc:
             res.status = "error"
             res.detail = str(exc)[:500]
             break
@@ -864,7 +1114,9 @@ def run_agentic(client: Ollama, model: str, task: Task, workdir: Path, target_di
 
         if reply.aborted or deadline.expired:
             res.status = "timeout"
-            res.detail = f"budget de {deadline.limit:.0f}s dépassé pendant la génération (tour {turn})"
+            res.detail = (f"{reply.abort_reason} (tour {turn})" if reply.abort_reason
+                          else f"budget de {deadline.limit:.0f}s dépassé pendant la "
+                               f"génération (tour {turn})")
             transcript.append({"turn": turn, "assistant": reply.content[:2000], "aborted": True})
             break
 
@@ -881,10 +1133,7 @@ def run_agentic(client: Ollama, model: str, task: Task, workdir: Path, target_di
         else:
             name, args = parse_text_action(reply.content, lang)
 
-        assistant_msg = {"role": "assistant", "content": reply.content}
-        if reply.tool_calls:
-            assistant_msg["tool_calls"] = reply.tool_calls[:1]
-        messages.append(assistant_msg)
+        messages.append(client.assistant_msg(reply))
 
         if name == "finish":
             transcript.append({"turn": turn, "action": "finish"})
@@ -909,8 +1158,7 @@ def run_agentic(client: Ollama, model: str, task: Task, workdir: Path, target_di
         })
 
         if reply.tool_calls:
-            messages.append({"role": "tool", "content": out,
-                             "tool_name": call.get("name", name)})
+            messages.append(client.tool_msg(reply.tool_calls[0], name, out))
         else:
             messages.append({"role": "user", "content": out})
 
@@ -938,6 +1186,8 @@ def run_agentic(client: Ollama, model: str, task: Task, workdir: Path, target_di
 # --------------------------------------------------------------------------- #
 
 CLI_PREFIX = "claude:"
+LITELLM_PREFIX = "litellm:"
+OLLAMA_PREFIX = "ollama:"
 
 AGENT_SYSTEM_CLI = """Tu es un agent de développement {label} autonome. Tu travailles dans ce projet :
 
@@ -1143,6 +1393,7 @@ class Result:
         self.prompt_tokens += reply.prompt_tokens
         self.gen_tokens += reply.gen_tokens
         self.eval_s += reply.eval_s
+        self.cost_usd += reply.cost_usd
         if not self.ttft_s:
             self.ttft_s = reply.ttft_s
 
@@ -1176,16 +1427,22 @@ STATUS_ICON = {
 
 def report(results: list[Result], out_dir: Path, config: dict) -> str:
     lines = []
-    lines.append("# Benchmark Rust — LLM local (Ollama)\n")
+    lines.append("# Benchmark de codage — Rust & Python\n")
     lines.append(f"- date : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"- machine : {config['machine']}")
     lines.append(f"- budget par (tâche, mode) : {config['task_timeout']:.0f}s "
                  f"(processus tué au-delà)")
     lines.append(f"- num_ctx={config['num_ctx']}, temperature={config['temperature']}, "
                  f"seed={config['seed']}, tours agentiques max={config['max_turns']}")
-    lines.append("")
 
     has_cli = any(r.model.startswith(CLI_PREFIX) for r in results)
+    has_litellm = any(r.model.startswith(LITELLM_PREFIX) for r in results)
+    if has_litellm:
+        lines.append(f"- endpoint LiteLLM : {config.get('litellm_base_url', '?')}")
+        if config.get("litellm_extra_body"):
+            lines.append(f"- corps supplémentaire LiteLLM : "
+                         f"`{json.dumps(config['litellm_extra_body'], ensure_ascii=False)}`")
+    lines.append("")
 
     lines.append("## Résultats détaillés\n")
     lines.append("| modèle | tâche | mode | statut | tests | temps | LLM | cargo | "
@@ -1199,6 +1456,22 @@ def report(results: list[Result], out_dir: Path, config: dict) -> str:
             f"| {r.tool_calls if not r.model.startswith(CLI_PREFIX) else '—'} | {r.loc} |"
         )
     lines.append("")
+
+    if has_litellm:
+        cost = sum(r.cost_usd for r in results if r.model.startswith(LITELLM_PREFIX))
+        lines.append("> ℹ️ **Lignes `litellm:*`.** Même harnais que les modèles Ollama "
+                     "(mêmes prompts, mêmes 4 outils, même boucle) : les deux modes sont "
+                     "donc comparables entre `litellm:*` et Ollama. À garder en tête :\n"
+                     ">\n"
+                     "> - **`tok/s`** est mesuré ici du premier au dernier token, réseau "
+                     "compris — pas le décodage pur d'Ollama (`eval_count / eval_duration`). "
+                     "Sur un endpoint distant, la latence réseau est dans le dénominateur.\n"
+                     "> - Les paramètres d'inférence (quantisation, contexte, batching) "
+                     "appartiennent au serveur derrière le proxy : `--num-ctx` ne s'y "
+                     "applique pas, utiliser `--litellm-extra-body` si le backend le "
+                     "supporte.\n"
+                     + (f"> - Coût rapporté par le proxy : **{cost:.4f} $**.\n" if cost else ""))
+        lines.append("")
 
     if has_cli:
         cost = sum(r.cost_usd for r in results if r.model.startswith(CLI_PREFIX))
@@ -1297,17 +1570,41 @@ def machine_info() -> str:
     return f"{cpu}, {ram} RAM"
 
 
+def split_backend(spec: str, default: str) -> tuple[str, str]:
+    """`litellm:gpt-4o-mini` → ('litellm', 'gpt-4o-mini'). Sans préfixe : backend par défaut."""
+    for prefix, backend in ((CLI_PREFIX, "claude"), (LITELLM_PREFIX, "litellm"),
+                            (OLLAMA_PREFIX, "ollama")):
+        if spec.startswith(prefix):
+            return backend, spec[len(prefix):]
+    return default, spec
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models", default="",
-                    help="liste séparée par des virgules. Un nom nu = modèle Ollama ; "
-                         "préfixe `claude:` = via le CLI Claude Code (ex: claude:opus)")
+                    help="liste séparée par des virgules. Préfixes : `ollama:` (défaut), "
+                         "`litellm:` (endpoint OpenAI-compatible), `claude:` (CLI Claude Code). "
+                         "Ex: qwen3.6:35b-mlx,litellm:gpt-4o-mini,claude:opus")
     ap.add_argument("--tasks", default="",
                     help="ex: rle,lru ou rust/rle,python/asn1_ber (défaut : toutes)")
     ap.add_argument("--lang", default="", help="rust, python, ou les deux (défaut)")
     ap.add_argument("--modes", default="direct,agentic")
     ap.add_argument("--host", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+    ap.add_argument("--backend", default="ollama", choices=["ollama", "litellm"],
+                    help="backend des modèles sans préfixe (défaut : ollama)")
+    ap.add_argument("--litellm-base-url",
+                    default=os.environ.get("LITELLM_BASE_URL")
+                            or os.environ.get("OPENAI_BASE_URL", "http://localhost:4000"),
+                    help="URL du proxy LiteLLM ou de tout endpoint OpenAI-compatible "
+                         "(défaut : $LITELLM_BASE_URL puis http://localhost:4000)")
+    ap.add_argument("--litellm-api-key",
+                    default=os.environ.get("LITELLM_API_KEY")
+                            or os.environ.get("OPENAI_API_KEY", ""),
+                    help="clé envoyée en Bearer (défaut : $LITELLM_API_KEY, sinon $OPENAI_API_KEY)")
+    ap.add_argument("--litellm-extra-body", default="",
+                    help="JSON fusionné dans le corps de chaque requête, ex: "
+                         "'{\"num_ctx\": 16384}' pour un modèle Ollama servi par le proxy")
     ap.add_argument("--task-timeout", type=float, default=600.0,
                     help="budget par (tâche, mode) en secondes ; au-delà on tue (défaut 600)")
     ap.add_argument("--cargo-timeout", type=float, default=120.0)
@@ -1317,12 +1614,21 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--keep-alive", default="15m")
     ap.add_argument("--agent-protocol", default="auto", choices=["auto", "tools", "text"])
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="saute l'appel de préchauffage (inutile et facturé sur une API distante)")
     ap.add_argument("--self-test", action="store_true",
                     help="vérifie les tests cachés avec les solutions de référence puis sort")
     args = ap.parse_args()
 
     if not args.host.startswith("http"):
         args.host = "http://" + args.host
+
+    try:
+        extra_body = json.loads(args.litellm_extra_body) if args.litellm_extra_body else {}
+    except json.JSONDecodeError as exc:
+        sys.exit(f"--litellm-extra-body : JSON invalide ({exc})")
+    if not isinstance(extra_body, dict):
+        sys.exit("--litellm-extra-body doit être un objet JSON")
 
     langs = [l.strip() for l in args.lang.split(",") if l.strip()] or None
     if langs and set(langs) - set(LANGS):
@@ -1342,7 +1648,9 @@ def main() -> int:
         sys.exit("indique au moins un modèle : --models qwen3.6:35b-mlx")
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
 
-    client = Ollama(args.host, args.num_ctx, args.temperature, args.seed, args.keep_alive)
+    ollama = Ollama(args.host, args.num_ctx, args.temperature, args.seed, args.keep_alive)
+    litellm = LiteLLM(args.litellm_base_url, args.litellm_api_key, args.temperature,
+                      args.seed, extra_body)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = RUNS_DIR / stamp
@@ -1351,6 +1659,9 @@ def main() -> int:
     config = {
         "machine": machine_info(),
         "host": args.host,
+        "backend": args.backend,
+        "litellm_base_url": litellm.base_url,
+        "litellm_extra_body": extra_body,
         "models": models,
         "tasks": [t.key for t in tasks],
         "modes": modes,
@@ -1365,42 +1676,54 @@ def main() -> int:
     print(f"Sortie : {out_dir}\nMachine : {config['machine']}\n")
 
     results: list[Result] = []
-    for model in models:
-        is_cli = model.startswith(CLI_PREFIX)
-        if is_cli:
-            cli_model = model[len(CLI_PREFIX):]
+    for spec in models:
+        backend, model = split_backend(spec, args.backend)
+        # étiquette portée par les résultats : un nom nu reste un modèle Ollama,
+        # pour ne pas casser la comparaison avec les runs précédents.
+        label = model if backend == "ollama" else f"{backend}:{model}"
+        client = {"ollama": ollama, "litellm": litellm}.get(backend)
+
+        if backend == "claude":
             if not shutil.which("claude"):
-                print(f"   💥 CLI `claude` introuvable pour {model}\n")
+                print(f"   💥 CLI `claude` introuvable pour {spec}\n")
                 continue
-            print(f"── {model} via le CLI Claude Code (auth abonnement)\n")
+            print(f"── {label} via le CLI Claude Code (auth abonnement)\n")
         else:
-            print(f"── chargement de {model} …", flush=True)
-            try:
-                load_s = client.warmup(model)
-            except OllamaError as exc:
-                print(f"   💥 {exc}\n")
-                continue
-            print(f"   prêt en {load_s:.1f}s\n")
+            # Ollama : le warm-up charge les poids, pour ne pas facturer le
+            # chargement au premier test. LiteLLM : il ne sert qu'à valider tôt
+            # l'endpoint, la clé et le nom du modèle.
+            where = "LiteLLM " + litellm.base_url if backend == "litellm" else "Ollama"
+            if args.no_warmup:
+                print(f"── {model} via {where}\n")
+            else:
+                print(f"── {model} via {where} : préchauffage …", flush=True)
+                try:
+                    warm_s = client.warmup(model)
+                except LlmError as exc:
+                    print(f"   💥 {exc}\n")
+                    continue
+                print(f"   prêt en {warm_s:.1f}s\n")
 
         for task in tasks:
             for mode in modes:
-                slug = f"{model}__{task.key}__{mode}".replace(":", "_").replace("/", "-")
+                slug = f"{label}__{task.key}__{mode}".replace(":", "_").replace("/", "-")
                 workdir = out_dir / slug
                 workdir.mkdir(parents=True, exist_ok=True)
-                print(f"▶ {model} · {task.key} · {mode} …", end="", flush=True)
+                print(f"▶ {label} · {task.key} · {mode} …", end="", flush=True)
                 deadline = Deadline(args.task_timeout)
-                if is_cli and mode == "direct":
-                    r = run_direct_cli(cli_model, task, workdir, target_dir,
+                if backend == "claude" and mode == "direct":
+                    r = run_direct_cli(model, task, workdir, target_dir,
                                        deadline, args.cargo_timeout)
-                elif is_cli:
-                    r = run_agentic_cli(cli_model, task, workdir, target_dir, deadline,
+                elif backend == "claude":
+                    r = run_agentic_cli(model, task, workdir, target_dir, deadline,
                                         args.cargo_timeout, args.max_turns)
                 elif mode == "direct":
                     r = run_direct(client, model, task, workdir, target_dir,
-                                   deadline, args.cargo_timeout)
+                                   deadline, args.cargo_timeout, label)
                 else:
                     r = run_agentic(client, model, task, workdir, target_dir, deadline,
-                                    args.cargo_timeout, args.max_turns, args.agent_protocol)
+                                    args.cargo_timeout, args.max_turns, args.agent_protocol,
+                                    label)
                 results.append(r)
                 print(f" {STATUS_ICON.get(r.status, r.status)} "
                       f"{r.passed}/{r.total} en {r.wall_s:.0f}s "
@@ -1409,7 +1732,7 @@ def main() -> int:
                 # rapport incrémental : on ne perd rien si on interrompt
                 report(results, out_dir, config)
 
-        if not is_cli and shutil.which("ollama"):
+        if backend == "ollama" and shutil.which("ollama"):
             # décharge les poids : plusieurs gros modèles ne tiennent pas
             # ensemble en RAM, et l'éviction automatique fausserait les temps.
             run_cmd(["ollama", "stop", model], ROOT, 60)
