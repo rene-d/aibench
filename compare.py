@@ -5,10 +5,11 @@ Fusionne plusieurs runs de bench.py en un seul tableau comparatif.
     python3 compare.py runs/20260731-023543 runs/20260731-025809
     python3 compare.py            # les 2 runs les plus récents
 
-Rappel de lecture : le mode `direct` est comparable entre backends (mêmes
-prompts, aucun outil), le mode `agentic` ne l'est pas si les backends diffèrent
-(boucle et outils différents), et `tok/s` n'a pas la même définition entre
-Ollama (décodage pur) et le CLI Claude Code (temps API bout en bout).
+Rappel de lecture : le mode `direct` est comparable entre tous les backends
+(mêmes prompts, aucun outil). Le mode `agentic` l'est entre `ollama` et
+`litellm:` (même boucle, mêmes outils) mais pas avec `claude:`, qui apporte les
+siens. Et `tok/s` n'a pas la même définition partout : décodage pur côté Ollama,
+temps bout en bout réseau compris côté `litellm:` et CLI Claude Code.
 """
 
 from __future__ import annotations
@@ -96,10 +97,11 @@ def main() -> int:
                        f"| {('%.2f $' % cost) if cost else '— (local)'} |")
         out.append("")
 
-    out.append("> `direct` est comparable entre backends (mêmes prompts, aucun outil). "
-               "`agentic` ne l'est pas si les backends diffèrent : boucle et outils "
-               "distincts. `tok/s` : décodage pur côté Ollama, temps API bout en bout "
-               "côté CLI Claude Code.\n")
+    out.append("> `direct` est comparable entre tous les backends (mêmes prompts, aucun "
+               "outil). `agentic` l'est entre Ollama et `litellm:` (même boucle, mêmes "
+               "outils), pas avec `claude:` qui apporte les siens. `tok/s` : décodage pur "
+               "côté Ollama, temps bout en bout réseau compris côté `litellm:` et CLI "
+               "Claude Code.\n")
 
     text = "\n".join(out)
     (RUNS / "comparatif.md").write_text(text)
