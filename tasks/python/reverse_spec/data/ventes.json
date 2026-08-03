@@ -1,0 +1,15 @@
+[
+  {"ref": "V-001", "region": "Nord", "montant": 120.50},
+  {"ref": "V-002", "region": " nord ", "montant": "80,00"},
+  {"ref": "V-003", "region": "NORD", "montant": 200.00},
+  {"ref": "V-004", "region": "Nord", "montant": 99.99, "annule": true},
+  {"ref": "V-005", "region": "Sud", "montant": "1 500,00"},
+  {"ref": "V-006", "region": "Sud", "montant": 250.25},
+  {"ref": "V-007", "region": "Est", "montant": 300.00},
+  {"ref": "V-008", "region": "est", "montant": "100,50"},
+  {"ref": "V-009", "region": "Est", "montant": 12.00, "annule": true},
+  {"ref": "V-010", "region": "Ouest", "montant": "400,50"},
+  {"ref": "V-011", "region": "OUEST", "montant": 400.50, "annule": false},
+  {"ref": "V-012", "region": "Corse", "montant": 999.00, "annule": true},
+  {"ref": "V-013", "region": "Sud ", "montant": "0,50"}
+]

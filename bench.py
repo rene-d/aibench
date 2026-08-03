@@ -44,6 +44,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TASKS_DIR = ROOT / "tasks"
 RUNS_DIR = ROOT / "runs"
+# sous-dossier d'une tâche contenant les jeux de données à analyser ; recopié tel
+# quel à la racine du projet, en mode direct comme en mode agentique
+DATA_DIR = "data"
 
 CARGO_TOML = """[package]
 name = "task"
@@ -55,6 +58,171 @@ path = "src/lib.rs"
 
 # Empêche cargo de remonter vers un workspace parent.
 [workspace]
+"""
+
+CMAKELISTS = """cmake_minimum_required(VERSION 3.16)
+project(task C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+add_compile_options(-Wall -Wextra -g)
+
+# Les erreurs mémoire et les UB doivent faire échouer le test, pas passer.
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+  set(SAN -fsanitize=address,undefined -fno-sanitize-recover=undefined
+          -fno-omit-frame-pointer)
+  add_compile_options(${SAN})
+  add_link_options(${SAN})
+endif()
+
+file(GLOB TASK_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.c")
+add_library(task STATIC ${TASK_SOURCES})
+target_include_directories(task PUBLIC "${CMAKE_SOURCE_DIR}/src")
+
+enable_testing()
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tests/*.c")
+foreach(test_src ${TEST_SOURCES})
+  get_filename_component(test_name ${test_src} NAME_WE)
+  add_executable(${test_name} ${test_src})
+  target_link_libraries(${test_name} PRIVATE task)
+  target_include_directories(${test_name} PRIVATE "${CMAKE_SOURCE_DIR}/tests")
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
+"""
+
+# Micro-runner d'assertions déposé dans tests/, pour la suite cachée comme pour
+# les tests que le modèle écrit lui-même. Format de sortie calqué sur `cargo
+# test`, ce qui permet de réutiliser les mêmes expressions rationnelles.
+C_HARNESS_H = r"""/* Micro-harnais de test — fourni par le benchmark, ne pas modifier. */
+#ifndef TASK_TEST_HARNESS_H
+#define TASK_TEST_HARNESS_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef void (*th_fn)(void);
+
+static struct { const char *name; th_fn fn; } th_reg[512];
+static int th_count;
+static int th_current_failed;
+
+static void th_register(const char *name, th_fn fn) {
+    if (th_count < (int)(sizeof th_reg / sizeof th_reg[0])) {
+        th_reg[th_count].name = name;
+        th_reg[th_count].fn = fn;
+        th_count++;
+    }
+}
+
+/* TEST(nom) { ... } : la fonction s'enregistre toute seule au démarrage. */
+#define TEST(name)                                                            \
+    static void th_test_##name(void);                                         \
+    __attribute__((constructor)) static void th_reg_##name(void) {            \
+        th_register(#name, th_test_##name);                                   \
+    }                                                                         \
+    static void th_test_##name(void)
+
+__attribute__((unused))
+static void th_fail(const char *file, int line, const char *what) {
+    th_current_failed = 1;
+    printf("FAILED\n    %s:%d: %s\n", file, line, what);
+}
+
+#define TH_FAILF(...)                                                         \
+    do {                                                                      \
+        th_current_failed = 1;                                                \
+        printf("FAILED\n    %s:%d: ", __FILE__, __LINE__);                    \
+        printf(__VA_ARGS__);                                                  \
+        printf("\n");                                                         \
+        return;                                                               \
+    } while (0)
+
+#define CHECK(cond)                                                           \
+    do {                                                                      \
+        if (!(cond)) { th_fail(__FILE__, __LINE__, #cond); return; }           \
+    } while (0)
+
+#define CHECK_INT_EQ(got, want)                                               \
+    do {                                                                      \
+        long long th_g = (long long)(got), th_w = (long long)(want);          \
+        if (th_g != th_w)                                                     \
+            TH_FAILF("%s == %s : obtenu %lld, attendu %lld",                  \
+                     #got, #want, th_g, th_w);                                \
+    } while (0)
+
+#define CHECK_UINT_EQ(got, want)                                              \
+    do {                                                                      \
+        unsigned long long th_g = (unsigned long long)(got);                  \
+        unsigned long long th_w = (unsigned long long)(want);                 \
+        if (th_g != th_w)                                                     \
+            TH_FAILF("%s == %s : obtenu %llu, attendu %llu",                  \
+                     #got, #want, th_g, th_w);                                \
+    } while (0)
+
+#define CHECK_DBL_EQ(got, want, eps)                                          \
+    do {                                                                      \
+        double th_g = (double)(got), th_w = (double)(want);                   \
+        double th_d = th_g - th_w;                                            \
+        if (th_d < 0) th_d = -th_d;                                           \
+        if (!(th_d <= (double)(eps)))                                         \
+            TH_FAILF("%s == %s : obtenu %.17g, attendu %.17g",                \
+                     #got, #want, th_g, th_w);                                \
+    } while (0)
+
+#define CHECK_STR_EQ(got, want)                                               \
+    do {                                                                      \
+        const char *th_g = (got), *th_w = (want);                             \
+        if (th_g == NULL || th_w == NULL || strcmp(th_g, th_w) != 0)          \
+            TH_FAILF("%s : obtenu \"%s\", attendu \"%s\"", #got,              \
+                     th_g ? th_g : "(null)", th_w ? th_w : "(null)");         \
+    } while (0)
+
+#define CHECK_MEM_EQ(got, want, n)                                            \
+    do {                                                                      \
+        const void *th_g = (got), *th_w = (want);                             \
+        size_t th_n = (size_t)(n);                                            \
+        if (th_g == NULL || th_w == NULL || memcmp(th_g, th_w, th_n) != 0)    \
+            TH_FAILF("%s : %zu octets différents de %s", #got, th_n, #want);  \
+    } while (0)
+
+#define CHECK_NULL(p)                                                         \
+    do {                                                                      \
+        if ((p) != NULL) TH_FAILF("%s devait être NULL", #p);                 \
+    } while (0)
+
+#define CHECK_NOT_NULL(p)                                                     \
+    do {                                                                      \
+        if ((p) == NULL) TH_FAILF("%s ne devait pas être NULL", #p);          \
+    } while (0)
+
+int main(void) {
+    int passed = 0, failed = 0;
+    /* sortie non tamponnée : un crash ne doit pas avaler les lignes déjà écrites */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("\nrunning %d tests\n", th_count);
+    for (int i = 0; i < th_count; i++) {
+        printf("test %s ... ", th_reg[i].name);
+        th_current_failed = 0;
+        th_reg[i].fn();
+        if (th_current_failed) {
+            failed++;
+        } else {
+            passed++;
+            printf("ok\n");
+        }
+    }
+    printf("\ntest result: %s. %d passed; %d failed\n",
+           failed ? "FAILED" : "ok", passed, failed);
+    return failed ? 1 : 0;
+}
+
+#endif /* TASK_TEST_HARNESS_H */
 """
 
 PY = sys.executable or "python3"
@@ -98,6 +266,8 @@ def run_cmd_split(argv: list[str], cwd: Path, timeout: float, env: dict | None =
     except subprocess.TimeoutExpired as exc:
         dec = lambda b: (b.decode(errors="replace") if isinstance(b, bytes) else (b or ""))
         return 124, dec(exc.stdout), dec(exc.stderr), time.monotonic() - t0, True
+    except Exception as exc:
+        return 127, "", f"[harness] {type(exc).__name__}: {exc}", time.monotonic() - t0, False
 
 
 def run_cmd(argv: list[str], cwd: Path, timeout: float, env: dict | None = None):
@@ -124,8 +294,8 @@ def run_cmd(argv: list[str], cwd: Path, timeout: float, env: dict | None = None)
                 out += chunk.decode() if isinstance(chunk, bytes) else chunk
         out += f"\n[harness] commande tuée après {timeout:.0f}s"
         return 124, out, time.monotonic() - t0, True
-    except FileNotFoundError as exc:
-        return 127, f"[harness] {exc}", time.monotonic() - t0, False
+    except Exception as exc:
+        return 127, f"[harness] {type(exc).__name__}: {exc}", time.monotonic() - t0, False
 
 
 # --------------------------------------------------------------------------- #
@@ -490,6 +660,7 @@ RUST_TEST_LINE = re.compile(r"^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED|ignored)", re.
 RUST_RESULT = re.compile(r"test result:\s+(ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed", re.M)
 PY_OK_LINE = re.compile(r"\.\.\. ok\s*$", re.M)
 PY_RAN = re.compile(r"^Ran (\d+) tests?", re.M)
+C_RUNNING = re.compile(r"^running \d+ tests?", re.M)
 
 
 class Lang:
@@ -501,6 +672,7 @@ class Lang:
     layout: str         # description de l'arborescence, pour les prompts
     test_cmd: str       # commande que l'agent est censé lancer
     allowed_cmds: str   # description de l'allowlist, pour les prompts
+    write_paths: str    # chemins que l'agent a le droit d'écrire, pour les prompts
 
     def scaffold(self, project: Path, source: str) -> None: ...
     def extras(self, project: Path) -> list[Path]: ...
@@ -526,6 +698,7 @@ class RustLang(Lang):
               "    tests/            (tu peux y écrire tes propres tests d'intégration)")
     test_cmd = "cargo test"
     allowed_cmds = "cargo build, cargo check, cargo test, cargo clippy, cargo fmt"
+    write_paths = "src/*.rs, tests/*.rs"
 
     def scaffold(self, project, source):
         (project / "src").mkdir(parents=True, exist_ok=True)
@@ -578,6 +751,7 @@ class PythonLang(Lang):
     test_cmd = f"{Path(PY).name} -m unittest discover -v"
     allowed_cmds = (f"{Path(PY).name} -m unittest ..., {Path(PY).name} -m py_compile ..., "
                     f"{Path(PY).name} <fichier>.py")
+    write_paths = "*.py à la racine"
 
     def scaffold(self, project, source):
         project.mkdir(parents=True, exist_ok=True)
@@ -624,7 +798,91 @@ class PythonLang(Lang):
         return True, len(PY_OK_LINE.findall(out)), max(n_tests, int(m.group(1)))
 
 
-LANGS = {l.name: l for l in (RustLang(), PythonLang())}
+class CLang(Lang):
+    name = "c"
+    entry = "src/solution.c"
+    test_path = "tests/hidden.c"
+    fences = ("c", "cpp")  # certains modèles étiquettent leur C en ```cpp
+    label = "C"
+    layout = ("    CMakeLists.txt    (fourni, ne pas modifier : compile src/*.c en "
+              "bibliothèque `task`\n"
+              "                       et un exécutable par fichier tests/*.c)\n"
+              "    src/solution.c    (à toi de le remplir)\n"
+              "    src/*.h           (tu peux ajouter tes propres en-têtes)\n"
+              "    tests/harness.h   (fourni : macros TEST(nom) et CHECK_*)\n"
+              "    tests/*.c         (tu peux y écrire tes propres tests)\n"
+              "\n"
+              "  Configure une fois avec `cmake -S . -B build`, puis compile avec\n"
+              "  `cmake --build build` et lance `ctest --test-dir build "
+              "--output-on-failure`.\n"
+              "  Compilation en C11 avec -Wall -Wextra et "
+              "-fsanitize=address,undefined : une\n"
+              "  erreur mémoire ou un comportement indéfini fait échouer le test.")
+    test_cmd = "ctest --test-dir build --output-on-failure"
+    allowed_cmds = ("cmake -S . -B build, cmake --build build, "
+                    "ctest --test-dir build --output-on-failure, ./build/<exécutable>")
+    write_paths = "src/*.c, src/*.h, tests/*.c, tests/*.h"
+
+    def scaffold(self, project, source):
+        (project / "src").mkdir(parents=True, exist_ok=True)
+        (project / "tests").mkdir(parents=True, exist_ok=True)
+        (project / "CMakeLists.txt").write_text(CMAKELISTS)
+        (project / "tests" / "harness.h").write_text(C_HARNESS_H)
+        (project / "src" / "solution.c").write_text(source or "/* Écris ton implémentation ici. */\n")
+
+    def extras(self, project):
+        src = project / "src"
+        if not src.exists():
+            return []
+        return [p for p in sorted(src.iterdir())
+                if p.suffix in (".c", ".h") and p.name != "solution.c"]
+
+    def collect(self, project):
+        f = project / "src" / "solution.c"
+        return f.read_text() if f.exists() else ""
+
+    def pre_argv(self):
+        return [["cmake", "-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Debug"],
+                ["cmake", "--build", "build", "--target", "hidden"]]
+
+    def tests_argv(self):
+        return ["./build/hidden"]
+
+    def count_tests(self, tests_src):
+        return len(re.findall(r"^\s*TEST\(", tests_src, re.M))
+
+    def write_ok(self, rel):
+        return (len(rel.parts) == 2 and rel.parts[0] in ("src", "tests")
+                and rel.suffix in (".c", ".h") and rel.name != "harness.h")
+
+    def normalise_cmd(self, parts):
+        if not parts:
+            return None
+        if parts[0] == "cmake":
+            if "--build" in parts:
+                return ["cmake", "--build", "build"] + parts[parts.index("--build") + 2:]
+            return ["cmake", "-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Debug"]
+        if parts[0] == "ctest":
+            return ["ctest", "--test-dir", "build", "--output-on-failure"]
+        # lancement direct d'un exécutable produit par le build
+        exe = parts[0].removeprefix("./")
+        if exe.startswith("build/") and "/" not in exe[len("build/"):]:
+            return ["./" + exe] + parts[1:]
+        return None
+
+    def parse(self, out, rc, n_tests):
+        seen = len(RUST_TEST_LINE.findall(out))
+        m = RUST_RESULT.search(out)
+        if m:
+            return True, int(m.group(2)), max(n_tests, seen, int(m.group(2)) + int(m.group(3)))
+        if C_RUNNING.search(out):
+            # binaire lancé puis interrompu (segfault, abort d'un sanitizer) :
+            # ce n'est pas une erreur de compilation, c'est un échec de test
+            return True, len(re.findall(r"\.\.\.\s+ok$", out, re.M)), n_tests
+        return False, 0, n_tests
+
+
+LANGS = {l.name: l for l in (RustLang(), PythonLang(), CLang())}
 
 
 @dataclass
@@ -639,6 +897,25 @@ class Grade:
     @property
     def score(self) -> float:
         return self.passed / self.total if self.total else 0.0
+
+
+def install_data(task: "Task", project: Path) -> None:
+    """Recopie les jeux de données de la tâche dans `<projet>/data/`."""
+    if not task.data_files:
+        return
+    dest_dir = project / DATA_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for src in task.data_files:
+        shutil.copyfile(src, dest_dir / src.name)
+
+
+def project_layout(task: "Task") -> str:
+    """Arborescence annoncée à l'agent, augmentée des données de la tâche."""
+    if not task.data_files:
+        return task.lang.layout
+    names = ", ".join(f"{DATA_DIR}/{p.name}" for p in task.data_files)
+    return (f"{task.lang.layout}\n"
+            f"    {DATA_DIR + '/':<18}(fourni, à analyser, à ne pas modifier : {names})")
 
 
 def grade(task: "Task", source: str, workdir: Path, target_dir: Path, timeout: float) -> Grade:
@@ -658,6 +935,7 @@ def grade(task: "Task", source: str, workdir: Path, target_dir: Path, timeout: f
         dest = project / Path(lang.entry).parent / extra.name
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(extra.read_text())
+    install_data(task, project)
     test_file = project / lang.test_path
     test_file.parent.mkdir(parents=True, exist_ok=True)
     test_file.write_text(task.tests_src)
@@ -708,6 +986,7 @@ class Task:
     reference: str
     n_tests: int
     extra_sources: list = field(default_factory=list)
+    data_files: list = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -732,6 +1011,7 @@ def load_tasks(names: list[str] | None, langs: list[str] | None) -> list[Task]:
             matched.update({key, short} & set(names or []))
             tests_src = (d / "tests").with_suffix(Path(lang.test_path).suffix).read_text()
             reference = (d / "reference").with_suffix(Path(lang.entry).suffix).read_text()
+            data_dir = d / DATA_DIR
             tasks.append(Task(
                 name=d.name,
                 lang=lang,
@@ -739,6 +1019,8 @@ def load_tasks(names: list[str] | None, langs: list[str] | None) -> list[Task]:
                 tests_src=tests_src,
                 reference=reference,
                 n_tests=lang.count_tests(tests_src),
+                data_files=(sorted(p for p in data_dir.iterdir() if p.is_file())
+                            if data_dir.is_dir() else []),
             ))
     if names:
         missing = set(names) - matched
@@ -784,7 +1066,9 @@ def strip_thinking(text: str) -> str:
 
 
 DEF_RE = {"rust": re.compile(r"\bpub\s+(fn|struct|enum)\b"),
-          "python": re.compile(r"^(def|class)\s+\w+", re.M)}
+          "python": re.compile(r"^(def|class)\s+\w+", re.M),
+          # une définition de fonction ou un #include en début de ligne
+          "c": re.compile(r"^(#include|[A-Za-z_][\w \t*]*\**\w+\s*\([^;]*\)\s*\{)", re.M)}
 
 
 def extract_code(text: str, lang: Lang) -> str:
@@ -808,18 +1092,37 @@ DIRECT_SYSTEM = (
 )
 
 DIRECT_USER = """{spec}
-
+{data}
 ---
 
 Rends TON code dans UN SEUL bloc ```{fence} contenant l'intégralité du fichier
 `{entry}`. Pas de point d'entrée exécutable, pas de dépendance externe, pas de
 commentaire d'introduction en dehors du bloc de code. Le code doit marcher tel quel."""
 
+# en mode direct le modèle n'a pas de système de fichiers : les données sont
+# inlinées dans le prompt, sinon la tâche d'analyse est ingagnable
+MAX_DATA_INLINE = 20000
+DATA_FENCE = {".json": "json", ".csv": "csv", ".jsonl": "json"}
+
+
+def inline_data(task: Task) -> str:
+    """Bloc de données joint au prompt direct (vide si la tâche n'en a pas)."""
+    if not task.data_files:
+        return ""
+    parts = ["\n---\n\nContenu des fichiers présents dans le projet :\n"]
+    for p in task.data_files:
+        text = p.read_text(errors="replace")
+        if len(text) > MAX_DATA_INLINE:
+            text = text[:MAX_DATA_INLINE] + "\n[...tronqué...]"
+        parts.append(f"`{DATA_DIR}/{p.name}` :\n\n```{DATA_FENCE.get(p.suffix, '')}\n{text}\n```\n")
+    return "\n".join(parts)
+
 
 def direct_messages(task: Task) -> tuple[str, str]:
     return (
         DIRECT_SYSTEM.format(label=task.lang.label),
-        DIRECT_USER.format(spec=task.spec, fence=task.lang.fences[0], entry=task.lang.entry),
+        DIRECT_USER.format(spec=task.spec, data=inline_data(task),
+                           fence=task.lang.fences[0], entry=task.lang.entry),
     )
 
 
@@ -887,9 +1190,8 @@ AGENT_USER = "Voici la tâche à réaliser.\n\n{spec}\n\nCommence maintenant."
 def build_tools(lang: Lang) -> list:
     tools = json.loads(json.dumps(TOOLS))  # copie profonde
     fn = {t["function"]["name"]: t["function"] for t in tools}
-    paths = "src/*.rs, tests/*.rs" if lang.name == "rust" else "*.py à la racine"
     fn["write_file"]["description"] = (
-        f"Écrit (ou écrase) un fichier du projet. Chemins autorisés : {paths}")
+        f"Écrit (ou écrase) un fichier du projet. Chemins autorisés : {lang.write_paths}")
     fn["write_file"]["parameters"]["properties"]["path"]["description"] = (
         f"chemin relatif, ex: {lang.entry}")
     fn["run_command"]["description"] = f"Exécute une commande. Autorisé : {lang.allowed_cmds}."
@@ -1068,13 +1370,15 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
     lang = task.lang
     project = workdir / "agent"
     lang.scaffold(project, "")
+    install_data(task, project)
     box = Sandbox(project, lang, target_dir, cargo_timeout)
     tools = build_tools(lang)
     text_proto = TEXT_PROTOCOL.format(entry=lang.entry, fence=lang.fences[0],
                                       test_cmd=lang.test_cmd)
 
     use_tools = protocol in ("tools", "auto")
-    system = AGENT_SYSTEM.format(max_turns=max_turns, label=lang.label, layout=lang.layout,
+    system = AGENT_SYSTEM.format(max_turns=max_turns, label=lang.label,
+                                 layout=project_layout(task),
                                  entry=lang.entry, test_cmd=lang.test_cmd)
     if not use_tools:
         system += "\n\n" + text_proto
@@ -1199,14 +1503,14 @@ Ta méthode :
  3. lis les erreurs, corrige, recommence ;
  4. quand tout marche et que tes tests passent, termine ton tour.
 
-Seules les commandes `{bash_prefix}` sont autorisées dans Bash.
+Seules les commandes commençant par {bash_prefix} sont autorisées dans Bash.
 Règles : bibliothèque standard uniquement, pas de point d'entrée exécutable, pas
 de dépendance externe.
 Ton code sera ensuite noté par une suite de tests cachée conforme à la
 spécification : respecte scrupuleusement les signatures demandées."""
 
-# outil Bash du CLI : préfixe autorisé par langage
-CLI_BASH_ALLOW = {"rust": "cargo", "python": Path(PY).name}
+# outil Bash du CLI : préfixes de commande autorisés, par langage
+CLI_BASH_ALLOW = {"rust": ("cargo",), "python": (Path(PY).name,), "c": ("cmake", "ctest")}
 
 
 def parse_cli_json(stdout: str) -> dict:
@@ -1315,17 +1619,20 @@ def run_direct_cli(model: str, task: Task, workdir: Path, target_dir: Path,
 def run_agentic_cli(model: str, task: Task, workdir: Path, target_dir: Path,
                     deadline: Deadline, cargo_timeout: float, max_turns: int) -> "Result":
     lang = task.lang
-    prefix = CLI_BASH_ALLOW[lang.name]
+    prefixes = CLI_BASH_ALLOW[lang.name]
+    shown = ", ".join(f"`{p}`" for p in prefixes)
     res = Result(model=CLI_PREFIX + model, task=task.key, mode="agentic",
-                 protocol=f"claude-code Read/Write/Bash({prefix})")
+                 protocol=f"claude-code Read/Write/Bash({'+'.join(prefixes)})")
     project = workdir / "agent"
     lang.scaffold(project, "")
+    install_data(task, project)
 
-    system = AGENT_SYSTEM_CLI.format(label=lang.label, layout=lang.layout, entry=lang.entry,
-                                     test_cmd=lang.test_cmd, bash_prefix=prefix)
+    system = AGENT_SYSTEM_CLI.format(label=lang.label, layout=project_layout(task),
+                                     entry=lang.entry,
+                                     test_cmd=lang.test_cmd, bash_prefix=shown)
     argv = cli_base_argv(model, system) + [
         "--tools", "Read,Write,Edit,Bash",
-        "--allowed-tools", f"Bash({prefix}:*)",
+        "--allowed-tools", ",".join(f"Bash({p}:*)" for p in prefixes),
         "--disallowed-tools", "WebSearch,WebFetch",
         "--permission-mode", "acceptEdits",
     ]
@@ -1639,6 +1946,10 @@ def main() -> int:
 
     if any(t.lang.name == "rust" for t in tasks) and not shutil.which("cargo"):
         sys.exit("cargo introuvable dans le PATH.")
+    if any(t.lang.name == "c" for t in tasks):
+        for tool in ("cmake", "ctest"):
+            if not shutil.which(tool):
+                sys.exit(f"{tool} introuvable dans le PATH.")
 
     if args.self_test:
         return 1 if self_test(tasks, target_dir, args.cargo_timeout) else 0
