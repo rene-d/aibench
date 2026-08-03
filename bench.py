@@ -289,7 +289,7 @@ def run_cmd(argv: list[str], cwd: Path, timeout: float, env: dict | None = None)
                 out += chunk.decode() if isinstance(chunk, bytes) else chunk
         out += f"\n[harness] commande tuée après {timeout:.0f}s"
         return 124, out, time.monotonic() - t0, True
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, UnicodeDecodeError) as exc:
         return 127, f"[harness] {exc}", time.monotonic() - t0, False
 
 
