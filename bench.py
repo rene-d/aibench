@@ -44,6 +44,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TASKS_DIR = ROOT / "tasks"
 RUNS_DIR = ROOT / "runs"
+# sous-dossier d'une tâche contenant les jeux de données à analyser ; recopié tel
+# quel à la racine du projet, en mode direct comme en mode agentique
+DATA_DIR = "data"
 
 CARGO_TOML = """[package]
 name = "task"
@@ -263,6 +266,8 @@ def run_cmd_split(argv: list[str], cwd: Path, timeout: float, env: dict | None =
     except subprocess.TimeoutExpired as exc:
         dec = lambda b: (b.decode(errors="replace") if isinstance(b, bytes) else (b or ""))
         return 124, dec(exc.stdout), dec(exc.stderr), time.monotonic() - t0, True
+    except Exception as exc:
+        return 127, "", f"[harness] {type(exc).__name__}: {exc}", time.monotonic() - t0, False
 
 
 def run_cmd(argv: list[str], cwd: Path, timeout: float, env: dict | None = None):
@@ -289,8 +294,8 @@ def run_cmd(argv: list[str], cwd: Path, timeout: float, env: dict | None = None)
                 out += chunk.decode() if isinstance(chunk, bytes) else chunk
         out += f"\n[harness] commande tuée après {timeout:.0f}s"
         return 124, out, time.monotonic() - t0, True
-    except (FileNotFoundError, UnicodeDecodeError) as exc:
-        return 127, f"[harness] {exc}", time.monotonic() - t0, False
+    except Exception as exc:
+        return 127, f"[harness] {type(exc).__name__}: {exc}", time.monotonic() - t0, False
 
 
 # --------------------------------------------------------------------------- #
@@ -894,6 +899,25 @@ class Grade:
         return self.passed / self.total if self.total else 0.0
 
 
+def install_data(task: "Task", project: Path) -> None:
+    """Recopie les jeux de données de la tâche dans `<projet>/data/`."""
+    if not task.data_files:
+        return
+    dest_dir = project / DATA_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for src in task.data_files:
+        shutil.copyfile(src, dest_dir / src.name)
+
+
+def project_layout(task: "Task") -> str:
+    """Arborescence annoncée à l'agent, augmentée des données de la tâche."""
+    if not task.data_files:
+        return task.lang.layout
+    names = ", ".join(f"{DATA_DIR}/{p.name}" for p in task.data_files)
+    return (f"{task.lang.layout}\n"
+            f"    {DATA_DIR + '/':<18}(fourni, à analyser, à ne pas modifier : {names})")
+
+
 def grade(task: "Task", source: str, workdir: Path, target_dir: Path, timeout: float) -> Grade:
     """Exécute la solution candidate contre la suite de tests cachée."""
     lang = task.lang
@@ -911,6 +935,7 @@ def grade(task: "Task", source: str, workdir: Path, target_dir: Path, timeout: f
         dest = project / Path(lang.entry).parent / extra.name
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(extra.read_text())
+    install_data(task, project)
     test_file = project / lang.test_path
     test_file.parent.mkdir(parents=True, exist_ok=True)
     test_file.write_text(task.tests_src)
@@ -961,6 +986,7 @@ class Task:
     reference: str
     n_tests: int
     extra_sources: list = field(default_factory=list)
+    data_files: list = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -985,6 +1011,7 @@ def load_tasks(names: list[str] | None, langs: list[str] | None) -> list[Task]:
             matched.update({key, short} & set(names or []))
             tests_src = (d / "tests").with_suffix(Path(lang.test_path).suffix).read_text()
             reference = (d / "reference").with_suffix(Path(lang.entry).suffix).read_text()
+            data_dir = d / DATA_DIR
             tasks.append(Task(
                 name=d.name,
                 lang=lang,
@@ -992,6 +1019,8 @@ def load_tasks(names: list[str] | None, langs: list[str] | None) -> list[Task]:
                 tests_src=tests_src,
                 reference=reference,
                 n_tests=lang.count_tests(tests_src),
+                data_files=(sorted(p for p in data_dir.iterdir() if p.is_file())
+                            if data_dir.is_dir() else []),
             ))
     if names:
         missing = set(names) - matched
@@ -1063,18 +1092,37 @@ DIRECT_SYSTEM = (
 )
 
 DIRECT_USER = """{spec}
-
+{data}
 ---
 
 Rends TON code dans UN SEUL bloc ```{fence} contenant l'intégralité du fichier
 `{entry}`. Pas de point d'entrée exécutable, pas de dépendance externe, pas de
 commentaire d'introduction en dehors du bloc de code. Le code doit marcher tel quel."""
 
+# en mode direct le modèle n'a pas de système de fichiers : les données sont
+# inlinées dans le prompt, sinon la tâche d'analyse est ingagnable
+MAX_DATA_INLINE = 20000
+DATA_FENCE = {".json": "json", ".csv": "csv", ".jsonl": "json"}
+
+
+def inline_data(task: Task) -> str:
+    """Bloc de données joint au prompt direct (vide si la tâche n'en a pas)."""
+    if not task.data_files:
+        return ""
+    parts = ["\n---\n\nContenu des fichiers présents dans le projet :\n"]
+    for p in task.data_files:
+        text = p.read_text(errors="replace")
+        if len(text) > MAX_DATA_INLINE:
+            text = text[:MAX_DATA_INLINE] + "\n[...tronqué...]"
+        parts.append(f"`{DATA_DIR}/{p.name}` :\n\n```{DATA_FENCE.get(p.suffix, '')}\n{text}\n```\n")
+    return "\n".join(parts)
+
 
 def direct_messages(task: Task) -> tuple[str, str]:
     return (
         DIRECT_SYSTEM.format(label=task.lang.label),
-        DIRECT_USER.format(spec=task.spec, fence=task.lang.fences[0], entry=task.lang.entry),
+        DIRECT_USER.format(spec=task.spec, data=inline_data(task),
+                           fence=task.lang.fences[0], entry=task.lang.entry),
     )
 
 
@@ -1322,13 +1370,15 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
     lang = task.lang
     project = workdir / "agent"
     lang.scaffold(project, "")
+    install_data(task, project)
     box = Sandbox(project, lang, target_dir, cargo_timeout)
     tools = build_tools(lang)
     text_proto = TEXT_PROTOCOL.format(entry=lang.entry, fence=lang.fences[0],
                                       test_cmd=lang.test_cmd)
 
     use_tools = protocol in ("tools", "auto")
-    system = AGENT_SYSTEM.format(max_turns=max_turns, label=lang.label, layout=lang.layout,
+    system = AGENT_SYSTEM.format(max_turns=max_turns, label=lang.label,
+                                 layout=project_layout(task),
                                  entry=lang.entry, test_cmd=lang.test_cmd)
     if not use_tools:
         system += "\n\n" + text_proto
@@ -1575,8 +1625,10 @@ def run_agentic_cli(model: str, task: Task, workdir: Path, target_dir: Path,
                  protocol=f"claude-code Read/Write/Bash({'+'.join(prefixes)})")
     project = workdir / "agent"
     lang.scaffold(project, "")
+    install_data(task, project)
 
-    system = AGENT_SYSTEM_CLI.format(label=lang.label, layout=lang.layout, entry=lang.entry,
+    system = AGENT_SYSTEM_CLI.format(label=lang.label, layout=project_layout(task),
+                                     entry=lang.entry,
                                      test_cmd=lang.test_cmd, bash_prefix=shown)
     argv = cli_base_argv(model, system) + [
         "--tools", "Read,Write,Edit,Bash",

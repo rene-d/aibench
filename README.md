@@ -3,7 +3,7 @@
 Harnais d'évaluation qui fait écrire du code à un modèle (local via Ollama,
 n'importe quel fournisseur via LiteLLM, ou Claude via le CLI) et note le résultat
 avec une **suite de tests cachée** que le modèle ne voit jamais. Trois langages,
-deux modes, 15 tâches, 284 tests.
+deux modes, 18 tâches, 330 tests.
 
 ## Installation
 
@@ -18,7 +18,7 @@ joignable, ou le CLI `claude`.
 # 1. vérifier que les tests cachés sont justes (les solutions de référence doivent passer 100 %)
 python3 bench.py --self-test
 
-# 2. évaluer un modèle sur tout le benchmark (15 tâches × 2 modes)
+# 2. évaluer un modèle sur tout le benchmark (18 tâches × 2 modes)
 python3 bench.py --models qwen3.6:35b-a3b-coding-mxfp8
 
 # 3. comparer plusieurs modèles, restreindre les tâches, les langages ou les modes
@@ -193,44 +193,41 @@ abonnement il n'est pas facturé en plus, il sert juste d'ordre de grandeur.
 
 ## Les tâches
 
-Des classiques dont le résultat attendu est connu et non ambigu, par difficulté
-croissante. Les séries Rust, Python et C se recoupent volontairement (`rle`,
-`word_freq`, `lru` sont posés dans les trois ; `asn1_ber` en Python et en C), ce
-qui permet de comparer un modèle à lui-même d'un langage à l'autre.
+Des classiques dont le résultat attendu est connu et non ambigu. Les séries
+Rust, Python et C se recoupent volontairement (`rle`, `word_freq`, `lru` sont
+posés dans les trois ; le décodeur BER en Python et en C), ce qui permet de
+comparer un modèle à lui-même d'un langage à l'autre.
 
-**Rust** (`tasks/rust/`) — 55 tests
+Les 18 tâches, dans l'ordre où `--self-test` les liste. « à produire » est le
+point d'entrée attendu : la suite cachée n'appelle que ça, et une signature
+approximative ne compile pas.
 
-| tâche | contenu | tests | ce que ça teste |
-|---|---|---|---|
-| `rle` | run-length encoding + decoding | 12 | logique de base, `chars().peekable()`, compteurs multi-chiffres |
-| `word_freq` | top-k des mots les plus fréquents | 10 | `HashMap`, départage lexicographique, minusculisation Unicode |
-| `lru` | cache LRU (LeetCode 146) | 10 | conception d'une structure, `&mut self`, récence, ownership |
-| `expr_eval` | analyseur descendant récursif | 23 | grammaire à 5 niveaux, associativité gauche **et** droite, `enum` d'erreurs |
+| tâche | à produire | tests | en une phrase | ce que ça teste vraiment |
+|---|---|---|---|---|
+| `c/ber` | `ber_decode` → arbre de `BerTlv` possédé, `ber_free` | 39 | décodeur ASN.1 BER (X.690) en C | la plus dure du lot : formes longues et indéfinies, `ber_free` unique même après échec à mi-parcours, `value` qui pointe dans l'entrée sans copie, débordements distingués de la troncature |
+| `c/csv` | `CsvError csv_parse(const char *, CsvTable **)` | 25 | analyseur CSV RFC 4180 | machine à états sur octets, guillemets échappés, `\r\n` contre `\r` isolé, deux familles d'erreurs |
+| `c/dijkstra` | `graph_new`/`graph_add_edge`, `dijkstra`, `dijkstra_path` | 19 | plus courts chemins avec reconstruction du chemin | tas binaire (O((V+E)·log V) exigé), départage déterministe des prédécesseurs, pas d'écriture partielle du résultat |
+| `c/lru` | type opaque `LruCache` + `lru_keys` | 17 | cache LRU en C | hachage **et** liste doublement chaînée, `out_value` pour ne pas confondre la valeur `0` et l'absence, O(1) exigé |
+| `c/rle` | `char *rle_encode(const char *)` / `rle_decode` | 19 | run-length encoding en C | propriété des chaînes, taille calculée avant `malloc`, validation du décodage |
+| `c/word_freq` | `word_freq` → tableau de `WordCount` possédé | 15 | top-k des mots les plus fréquents en C | table de hachage à la main, `qsort` avec départage, `strdup`/`free` symétriques |
+| `python/asn1_ber` | `decode(data: bytes) -> TLV` | 36 | le même décodeur BER, en Python | tag et longueur en forme longue, longueur indéfinie, règle du premier arc d'OID, INTEGER signé, six familles d'erreurs — finit sur une vraie PDU SNMP |
+| `python/expr_eval` | `eval_expr(expr: str) -> float` | 25 | évaluateur d'expressions arithmétiques | grammaire à 5 niveaux, `^` associatif à droite, unaire moins liant que la puissance, `%` à la sémantique Python, `eval()` interdit |
+| `python/json_report` | `report(path: str) -> dict` | 20 | agrégats sur un export JSON sale | **analyse de fichier** : montants et dates multi-formats, doublons, champs absents — tout se découvre en lisant `data/commandes.json` |
+| `python/log_triage` | `triage(path: str) -> list` | 15 | regroupement des erreurs d'un journal | **analyse de fichier** : quatre écritures d'horodatage, traces multi-lignes à rattacher, journal non trié |
+| `python/lru` | classe `LRUCache` avec `__len__` | 11 | cache LRU en Python | récence, capacité, ne pas confondre la valeur `0` et l'absence |
+| `python/reverse_spec` | `rendu(path: str) -> str` | 11 | reproduire un rapport dont la spec est perdue | **analyse de fichier** : aucune règle donnée, tout se déduit en comparant l'entrée à la sortie attendue |
+| `python/rle` | `encode(text: str)` / `decode(text: str)` | 12 | run-length encoding en Python | logique de base, compteurs multi-chiffres, décodage strict |
+| `python/word_freq` | `top_k(text, k) -> list[tuple[str, int]]` | 11 | top-k des mots les plus fréquents | départage lexicographique, minusculisation Unicode, renvoyer des `tuple` et non des `list` |
+| `rust/expr_eval` | `eval(expr: &str) -> Result<f64, EvalError>` | 23 | le même évaluateur, en Rust | même grammaire, plus un `enum` d'erreurs à faire correspondre exactement |
+| `rust/lru` | `LruCache::new/get/put/len/is_empty` | 10 | cache LRU en Rust | conception d'une structure, `&mut self`, récence, ownership |
+| `rust/rle` | `encode(&str) -> String` / `decode(&str) -> String` | 12 | run-length encoding en Rust | `chars().peekable()`, compteurs multi-chiffres |
+| `rust/word_freq` | `top_k(&str, usize) -> Vec<(String, usize)>` | 10 | top-k des mots les plus fréquents en Rust | `HashMap`, départage lexicographique, minusculisation Unicode |
 
-**Python** (`tasks/python/`) — 95 tests
-
-| tâche | contenu | tests | ce que ça teste |
-|---|---|---|---|
-| `rle` | idem Rust | 12 | idem |
-| `word_freq` | idem, avec `str.isalnum()` | 11 | + renvoyer des `tuple`, pas des `list` |
-| `lru` | idem, avec `__len__` | 11 | + ne pas confondre valeur `0` et absence |
-| `expr_eval` | idem, sémantique `%` **de Python** (`-7 % 3 == 2`) | 25 | + hiérarchie d'exceptions, interdiction d'`eval()` |
-| `asn1_ber` | décodeur de PDU ASN.1 en BER (X.690) | 36 | la plus dure du lot, voir ci-dessous |
-
-**C** (`tasks/c/`) — 134 tests
-
-| tâche | contenu | tests | ce que ça teste |
-|---|---|---|---|
-| `rle` | idem Rust, mais avec des `char *` alloués | 19 | propriété des chaînes, calcul de taille avant `malloc`, validation du décodage |
-| `word_freq` | idem, avec un tableau de `WordCount` possédé | 15 | table de hachage à la main, `qsort` avec départage, `strdup`/`free` symétriques |
-| `lru` | idem, type opaque + `lru_keys` pour observer la récence | 17 | hachage **et** liste doublement chaînée, `out_value` pour ne pas confondre valeur `0` et absence, O(1) exigé |
-| `csv` | analyseur RFC 4180 | 25 | machine à états sur octets, guillemets échappés, `\r\n` vs `\r` isolé, deux familles d'erreurs |
-| `dijkstra` | plus courts chemins + reconstruction | 19 | tas binaire (O((V+E) log V) exigé), départage déterministe des prédécesseurs, pas d'écriture partielle |
-| `ber` | décodeur ASN.1 BER, arbre de TLV possédé | 39 | la plus dure du lot, voir ci-dessous |
+Par série : **Rust** 55 tests, **Python** 141, **C** 134.
 
 ### `expr_eval` — le premier palier
 
-Les trois premières tâches saturent à 100 % dès qu'un modèle est correct. La
+`rle`, `word_freq` et `lru` saturent à 100 % dès qu'un modèle est correct. La
 difficulté d'`expr_eval` tient aux détails les plus souvent ratés : `^`
 associatif à droite (`2^3^2 == 512`, pas 64), l'unaire qui lie moins fort que la
 puissance (`-2^2 == -4`, pas 4), et le bon variant d'erreur pour chaque entrée
@@ -269,6 +266,24 @@ En plus de tout ce qui précède :
   de tag, sous-identifiant d'OID) ou dans un `long long` (INTEGER de plus de
   8 octets) de la simple troncature.
 
+### `json_report`, `log_triage`, `reverse_spec` — l'analyse de données
+
+Ces trois tâches Python ne mesurent pas la même chose que les autres : le code à
+écrire y est court et sans finesse algorithmique, mais **il est impossible de
+l'écrire correctement sans avoir lu le jeu de données livré avec la tâche**. La
+spec dit qu'un problème existe, le fichier dit sous quelle forme.
+
+| tâche | entrée | ce qu'il faut trouver dans le fichier |
+|---|---|---|
+| `json_report` | `data/commandes.json` | montants tantôt nombres tantôt texte (virgule décimale, séparateur de milliers dont un **insécable**), euro écrit `EUR`/`eur`/`€`/absent, trois formats de date dont un datetime, une date bien formée mais inexistante (`2026-02-30`), doublons d'`id`, champs absents ou `null` |
+| `log_triage` | `data/app.log` | quatre écritures d'horodatage dont un **epoch**, niveaux en casse libre et entre crochets, traces d'exception multi-lignes à rattacher à leur en-tête, journal **non trié** (l'ordre des lignes n'est pas l'ordre du temps) |
+| `reverse_spec` | `data/ventes.json` + `data/rapport_attendu.txt` | **aucune règle n'est donnée** : filtre, normalisation, tri, départage et formatage se déduisent en comparant l'entrée à la sortie attendue |
+
+Les suites cachées appellent la fonction sur **d'autres** fichiers que celui
+livré : coder en dur le résultat du fichier fourni ne rapporte qu'un test.
+`reverse_spec` est le discriminant le plus dur du lot — un modèle qui survole
+produit un rapport plausible et rate tout le reste.
+
 ### Structure d'une tâche
 
 ```
@@ -276,9 +291,20 @@ tasks/<langage>/<nom>/
   spec.md                             # ce que voit le modèle
   tests.rs | tests.py | tests.c       # suite cachée, jamais montrée au modèle
   reference.rs | reference.py | reference.c   # solution de référence, sert au --self-test
+  data/                               # facultatif : jeux de données à analyser
 ```
 
 Les pièges sont volontaires et documentés dans chaque spec.
+
+Si `data/` existe, son contenu est recopié tel quel à la racine du projet
+(`data/…`), pour le grading comme pour les deux modes :
+
+- en **mode agentique**, l'agent le trouve sur son disque et peut l'inspecter
+  (`read_file`, `Read`, ou un `python3 script.py` d'exploration) ;
+- en **mode direct**, le modèle n'a pas de système de fichiers : les fichiers de
+  données sont **inlinés dans le prompt** (tronqués à 20 000 caractères), sinon
+  la tâche serait ingagnable. La comparaison direct/agentique reste donc
+  honnête, au coût d'un prompt plus gros.
 
 ## Notation
 
@@ -330,6 +356,27 @@ runs/<horodatage>/
 
 Le rapport est réécrit après **chaque** couple : interrompre le benchmark ne
 fait rien perdre.
+
+### Récapitulatif de tous les runs
+
+`recap.py` balaie `runs/`, ne garde que la mesure **la plus récente** pour chaque
+`(machine, hôte, backend, modèle, tâche, mode)` et engendre un document
+**Typst**, compilé en PDF si `typst` est installé.
+
+```bash
+python3 recap.py                                  # runs/recapitulatif.typ + .pdf
+python3 recap.py --backend ollama --mode direct   # filtres
+python3 recap.py --no-pdf --print                 # source Typst sur stdout
+```
+
+Un modèle par colonne, un test (tâche × mode) par ligne, une cellule
+`statut · tests passés/total · temps · tours`. Le statut est coloré et dit
+*pourquoi* c'est KO : `KO tests`, `KO compil`, `KO délai`, `KO backend`,
+`KO vide`. Une section par contexte de mesure — mélanger deux machines ou deux
+backends dans un même tableau ferait comparer ce qui n'est pas comparable.
+
+`compare.py` reste utile pour l'autre question : confronter deux runs précis, en
+markdown.
 
 ## Limites connues
 

@@ -1,0 +1,6 @@
+region;commandes;total
+SUD;3;1750.75
+OUEST;2;801.00
+EST;2;400.50
+NORD;3;400.50
+TOTAL;10;3352.75

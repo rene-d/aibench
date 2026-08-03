@@ -1,0 +1,22 @@
+== application log, rotation du 2026-01-04 ==
+demarrage, pid 213
+2026-01-04T08:12:03Z ERROR db: timeout after 30s (conn=17)
+2026-01-04 08:12:04,120 WARN cache: miss key=u:8891
+2026-01-04 08:12:09,004 ERROR db: timeout after 30s (conn=22)
+Traceback (most recent call last):
+  File "pool.py", line 88, in acquire
+    raise TimeoutError("pool exhausted")
+TimeoutError: pool exhausted
+04/01/2026 08:13:41 [INFO] http: GET /health 200
+[1767514500] ERROR db: timeout after 5s (conn=3)
+2026-01-04T08:10:00Z error auth: invalid token for user 8891
+04/01/2026 08:20:02 FATAL oom: killed worker 12
+2026-01-04 08:21:00 fatal oom: killed worker 7
+  supervisor: redemarrage dans 5s
+2026-01-04T08:22:00Z DEBUG db: pool resized to 32
+2026-01-04T08:23:10Z WARN db: timeout after 30s (conn=99)
+2026-01-04T08:25:00Z ERROR http: 502 from upstream backend-3
+[1767515190] ERROR db: timeout after 30s (conn=41)
+2026-01-04T08:09:00Z ERROR auth: invalid token for user 42
+2026-01-04T08:31:00Z bidule quelque chose qui ne ressemble a rien
+  cette ligne suit une entree sans niveau connu
