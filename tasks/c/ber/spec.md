@@ -96,6 +96,8 @@ Exemple : `04 81 C8` → OCTET STRING de 200 octets. `04 82 01 00` → 256 octet
 
 Décode les octets de contenu d'un INTEGER : gros-boutiste, **complément à deux
 signé**. Contenu vide → `BER_INVALID`. Plus de 8 octets → `BER_OVERFLOW`.
+La valeur décodée n'est écrite dans `*out` qu'en cas de succès : en cas
+d'erreur, `*out` n'est pas modifié.
 
 ```c
 ber_decode_integer((const unsigned char *)"\x7f", 1, &v);          /*  127 */
