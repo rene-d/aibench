@@ -1495,7 +1495,12 @@ OLLAMA_PREFIX = "ollama:"
 
 AGENT_SYSTEM_CLI = """Tu es un agent de développement {label} autonome. Tu travailles dans ce projet :
 
+{root}
 {layout}
+
+Ton répertoire de travail courant est déjà `{root}` : n'utilise que des chemins
+relatifs (`{entry}`), jamais de chemin absolu — toute écriture hors de ce
+répertoire est refusée.
 
 Ta méthode :
  1. écris `{entry}` avec l'outil Write ;
@@ -1628,7 +1633,7 @@ def run_agentic_cli(model: str, task: Task, workdir: Path, target_dir: Path,
     install_data(task, project)
 
     system = AGENT_SYSTEM_CLI.format(label=lang.label, layout=project_layout(task),
-                                     entry=lang.entry,
+                                     root=project.resolve(), entry=lang.entry,
                                      test_cmd=lang.test_cmd, bash_prefix=shown)
     argv = cli_base_argv(model, system) + [
         "--tools", "Read,Write,Edit,Bash",
