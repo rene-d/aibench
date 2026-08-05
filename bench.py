@@ -22,6 +22,7 @@ Usage :
     python3 bench.py --models litellm:gpt-4o-mini --litellm-base-url http://localhost:4000
     python3 bench.py --models claude:opus --lang python
     python3 bench.py --models a,b --tasks rust/rle,python/asn1_ber --modes direct
+    python3 bench.py --models claude:haiku --tasks python/rle -v   # trace les échanges
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import http.client
 import json
 import os
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -228,6 +230,79 @@ int main(void) {
 PY = sys.executable or "python3"
 
 # --------------------------------------------------------------------------- #
+# Trace verbeuse (-v / -vv)
+# --------------------------------------------------------------------------- #
+
+# 0 : silencieux (défaut) — 1 : prompts, réponses, outils demandés et leurs
+# résultats — 2 : en plus, le contexte complet renvoyé à chaque tour, les
+# raisonnements et aucune troncature.
+VERBOSE = 0
+VERBOSE_CLIP = 1500  # caractères par bloc à -v ; -vv n'en coupe aucun
+
+
+def _dim(text: str) -> str:
+    return f"\033[2m{text}\033[0m" if sys.stdout.isatty() else text
+
+
+def vclip(text: str) -> str:
+    """Coupe au milieu : le début et la fin d'un bloc sont les plus parlants."""
+    if VERBOSE >= 2 or len(text) <= VERBOSE_CLIP:
+        return text
+    half = VERBOSE_CLIP // 2
+    return (f"{text[:half]}\n[…{len(text) - VERBOSE_CLIP} caractères coupés, "
+            f"-vv pour tout voir…]\n{text[-half:]}")
+
+
+def vsection(label: str, body: str = "", level: int = 1) -> None:
+    """Affiche un bloc encadré, si la verbosité demandée est atteinte."""
+    if VERBOSE < level or not (body or "").strip():
+        return
+    print(_dim(f"  ┌─ {label} " + "─" * max(3, 67 - len(label))))
+    for line in vclip(body.rstrip()).splitlines():
+        print(_dim("  │ ") + line)
+    print(_dim("  └" + "─" * 70), flush=True)
+
+
+def vline(text: str, level: int = 1) -> None:
+    if VERBOSE >= level:
+        print(_dim(f"  · {text}"), flush=True)
+
+
+def vmessages(messages: list, label: str = "prompt", level: int = 1) -> None:
+    """Affiche les messages tels qu'ils partent vers le modèle."""
+    if VERBOSE < level:
+        return
+    for msg in messages:
+        body = msg.get("content") or ""
+        if not isinstance(body, str):  # contenu structuré éventuel
+            body = json.dumps(body, ensure_ascii=False, indent=2)
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            body += f"\n[appel d'outil] {fn.get('name')}({fn.get('arguments')})"
+        vsection(f"{label} · {msg.get('role', '?')}", body, level)
+
+
+def vtools(tools: list | None, level: int = 1) -> None:
+    """Affiche les outils déclarés au modèle (schéma résumé)."""
+    if VERBOSE < level or not tools:
+        return
+    lines = []
+    for t in tools:
+        fn = t.get("function") or {}
+        props = (fn.get("parameters") or {}).get("properties") or {}
+        lines.append(f"{fn.get('name')}({', '.join(props)}) — {fn.get('description', '')}")
+    vsection("outils déclarés", "\n".join(lines), level)
+
+
+def vcall(name: str, args: dict, level: int = 1) -> None:
+    """Affiche l'outil demandé par le modèle et ses arguments."""
+    if VERBOSE < level:
+        return
+    vsection(f"outil demandé · {name or '?'}",
+             json.dumps(args or {}, ensure_ascii=False, indent=2), level)
+
+
+# --------------------------------------------------------------------------- #
 # Utilitaires processus / temps
 # --------------------------------------------------------------------------- #
 
@@ -336,8 +411,16 @@ class LlmReply:
 
 
 def read_timeout(budget: float) -> float:
-    """Timeout *de lecture* d'un flux : il s'applique à chaque bloc reçu."""
-    return max(5.0, min(budget, 120.0))
+    """Timeout *de lecture* d'un flux : il s'applique à chaque bloc reçu.
+
+    Pas de plafond en dur : avec des outils, un backend peut ne rien émettre
+    tant que l'appel n'est pas complet (le parseur gemma4 d'Ollama accumule
+    tout le bloc et ne le rend qu'au dernier chunk), si bien que le premier
+    octet arrive après toute la génération. Un plafond plus court que le budget
+    transformerait ce silence légitime en erreur de transport ; le garde-fou,
+    c'est le budget de la tâche.
+    """
+    return max(5.0, budget)
 
 
 def note_abort(reply: LlmReply, exc: BaseException, timeout: float) -> None:
@@ -356,12 +439,14 @@ def note_abort(reply: LlmReply, exc: BaseException, timeout: float) -> None:
 
 
 class Ollama:
-    def __init__(self, host: str, num_ctx: int, temperature: float, seed: int, keep_alive: str):
+    def __init__(self, host: str, num_ctx: int, temperature: float, seed: int, keep_alive: str,
+                 num_predict: int):
         self.host = host.rstrip("/")
         self.num_ctx = num_ctx
         self.temperature = temperature
         self.seed = seed
         self.keep_alive = keep_alive
+        self.num_predict = num_predict
 
     def chat(self, model: str, messages: list, tools: list | None, budget: float) -> LlmReply:
         payload = {
@@ -373,6 +458,10 @@ class Ollama:
                 "num_ctx": self.num_ctx,
                 "temperature": self.temperature,
                 "seed": self.seed,
+                # filet contre les générations qui partent en boucle : sans
+                # plafond, un modèle peut remplir tout le contexte sans jamais
+                # rendre la main (vu en agentique, dans un appel d'outil).
+                "num_predict": self.num_predict,
             },
         }
         if tools:
@@ -474,7 +563,7 @@ class LiteLLM:
     """
 
     def __init__(self, base_url: str, api_key: str, temperature: float, seed: int,
-                 extra_body: dict | None = None):
+                 num_predict: int, extra_body: dict | None = None):
         url = base_url.rstrip("/")
         if not url.startswith("http"):
             url = "http://" + url
@@ -484,6 +573,7 @@ class LiteLLM:
         self.api_key = api_key
         self.temperature = temperature
         self.seed = seed
+        self.num_predict = num_predict
         self.extra_body = extra_body or {}
 
     def _headers(self) -> dict:
@@ -526,6 +616,8 @@ class LiteLLM:
             # sans ça, la plupart des backends omettent l'usage en streaming
             "stream_options": {"include_usage": True},
             "temperature": self.temperature,
+            # même filet anti-boucle que `num_predict` côté Ollama
+            "max_tokens": self.num_predict,
         }
         if self.seed:
             payload["seed"] = self.seed
@@ -1132,6 +1224,7 @@ def run_direct(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
     res = Result(model=label or model, task=task.key, mode="direct", protocol="single-shot")
     system, user = direct_messages(task)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    vmessages(messages)
     try:
         reply = client.chat(model, messages, None, budget=deadline.remaining)
     except LlmError as exc:
@@ -1142,6 +1235,8 @@ def run_direct(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
 
     res.turns = 1
     res.absorb(reply)
+    vsection("réflexion", reply.thinking, level=2)
+    vsection("réponse", reply.content)
     (workdir / "raw_reply.md").write_text(reply.thinking + "\n\n" + reply.content)
 
     if reply.aborted or deadline.expired:
@@ -1387,12 +1482,17 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
         {"role": "user", "content": AGENT_USER.format(spec=task.spec)},
     ]
     transcript = []
+    vtools(tools if use_tools else None)
+    vmessages(messages)
 
     for turn in range(1, max_turns + 1):
         if deadline.expired:
             res.status = "timeout"
             res.detail = f"budget de {deadline.limit:.0f}s dépassé au tour {turn}"
             break
+        vline(f"tour {turn}/{max_turns} — protocole {res.protocol}")
+        # à -vv, le contexte complet tel qu'il repart à chaque tour
+        vmessages(messages, label=f"contexte tour {turn}", level=2)
         try:
             reply = client.chat(model, messages, tools if use_tools else None,
                                 budget=deadline.remaining)
@@ -1402,6 +1502,8 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
                 res.protocol = protocol = "text"
                 use_tools = False
                 messages[0]["content"] = system + "\n\n" + text_proto
+                vline("outils non supportés : bascule sur le protocole texte")
+                vsection("nouveau prompt système", messages[0]["content"])
                 continue
             res.status = "error"
             res.detail = "le modèle ne supporte pas les outils"
@@ -1413,6 +1515,8 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
 
         res.turns = turn
         res.absorb(reply)
+        vsection(f"tour {turn} · réflexion", reply.thinking, level=2)
+        vsection(f"tour {turn} · réponse", reply.content)
         if use_tools and protocol == "auto" and reply.tool_calls:
             res.protocol = "tools"
 
@@ -1438,6 +1542,7 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
             name, args = parse_text_action(reply.content, lang)
 
         messages.append(client.assistant_msg(reply))
+        vcall(name, args)
 
         if name == "finish":
             transcript.append({"turn": turn, "action": "finish"})
@@ -1453,6 +1558,7 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
                    "run_command ou finish.")
             res.malformed += 1
 
+        vsection(f"tour {turn} · résultat de {name or '?'}", out)
         res.tool_calls += 1
         transcript.append({
             "turn": turn,
@@ -1562,16 +1668,63 @@ def absorb_cli(res: "Result", data: dict, model_id: str) -> None:
 
 
 def cli_base_argv(model: str, system: str) -> list[str]:
+    # En verbeux on demande le flux JSONL : il laisse voir les outils demandés
+    # tour par tour, et sa dernière ligne reste l'objet `type: result` attendu
+    # par parse_cli_json — les métriques sont donc identiques.
+    fmt = (["--output-format", "stream-json", "--verbose"] if VERBOSE
+           else ["--output-format", "json"])
     return [
         "claude", "-p",
         "--model", model,
         "--system-prompt", system,
-        "--output-format", "json",
+        *fmt,
         "--safe-mode",              # neutralise CLAUDE.md, skills, plugins, hooks
         "--no-session-persistence",
     ]
     # NB : le prompt passe par stdin, jamais en argument positionnel — les options
     # variadiques (`--tools`, `--allowed-tools`) l'avaleraient sinon.
+
+
+def vcli(argv: list[str], system: str, user: str) -> None:
+    """Ce qui part vers le CLI : prompts, outils autorisés, ligne de commande."""
+    vsection("prompt système", system)
+    vsection("prompt utilisateur", user)
+    vsection("commande CLI", " ".join(shlex.quote(a) for a in argv), level=2)
+
+
+def vcli_stream(stdout: str, level: int = 1) -> None:
+    """Rejoue le flux JSONL du CLI : texte de l'assistant et outils demandés."""
+    if VERBOSE < level:
+        return
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") not in ("assistant", "user"):
+            continue
+        content = (ev.get("message") or {}).get("content")
+        if isinstance(content, str):
+            vsection("réponse du CLI", content, level)
+            continue
+        for block in content or []:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                vsection("réponse du CLI", block.get("text", ""), level)
+            elif kind == "thinking":
+                vsection("réflexion du CLI", block.get("thinking", ""), level + 1)
+            elif kind == "tool_use":
+                vcall(block.get("name", "?"), block.get("input") or {}, level)
+            elif kind == "tool_result":
+                out = block.get("content")
+                if isinstance(out, list):
+                    out = "\n".join(b.get("text", "") for b in out if isinstance(b, dict))
+                vsection("résultat outil", str(out or ""), level)
 
 
 def _cli_fail(res: "Result", data: dict, stderr: str, killed: bool, deadline: Deadline) -> bool:
@@ -1599,7 +1752,9 @@ def run_direct_cli(model: str, task: Task, workdir: Path, target_dir: Path,
 
     system, user = direct_messages(task)
     argv = cli_base_argv(model, system) + ["--tools", ""]  # aucun outil
+    vcli(argv, system, user)
     rc, out, err, secs, killed = run_cmd_split(argv, cwd, deadline.remaining, stdin_text=user)
+    vcli_stream(out)
     data = parse_cli_json(out)
     (workdir / "cli_result.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
@@ -1641,10 +1796,13 @@ def run_agentic_cli(model: str, task: Task, workdir: Path, target_dir: Path,
         "--disallowed-tools", "WebSearch,WebFetch",
         "--permission-mode", "acceptEdits",
     ]
+    user = AGENT_USER.format(spec=task.spec)
+    vcli(argv, system, user)
     rc, out, err, secs, killed = run_cmd_split(
         argv, project, deadline.remaining, env=lang.env(target_dir),
-        stdin_text=AGENT_USER.format(spec=task.spec),
+        stdin_text=user,
     )
+    vcli_stream(out)
     data = parse_cli_json(out)
     (workdir / "cli_result.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
@@ -1739,13 +1897,14 @@ STATUS_ICON = {
 
 def report(results: list[Result], out_dir: Path, config: dict) -> str:
     lines = []
-    lines.append("# Benchmark de codage — Rust & Python\n")
+    lines.append("# Benchmark de codage — C, Rust & Python\n")
     lines.append(f"- date : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"- machine : {config['machine']}")
     lines.append(f"- budget par (tâche, mode) : {config['task_timeout']:.0f}s "
                  f"(processus tué au-delà)")
-    lines.append(f"- num_ctx={config['num_ctx']}, temperature={config['temperature']}, "
-                 f"seed={config['seed']}, tours agentiques max={config['max_turns']}")
+    lines.append(f"- num_ctx={config['num_ctx']}, num_predict={config.get('num_predict', '?')}, "
+                 f"temperature={config['temperature']}, seed={config['seed']}, "
+                 f"tours agentiques max={config['max_turns']}")
 
     has_cli = any(r.model.startswith(CLI_PREFIX) for r in results)
     has_litellm = any(r.model.startswith(LITELLM_PREFIX) for r in results)
@@ -1922,6 +2081,9 @@ def main() -> int:
     ap.add_argument("--cargo-timeout", type=float, default=120.0)
     ap.add_argument("--max-turns", type=int, default=12)
     ap.add_argument("--num-ctx", type=int, default=16384)
+    ap.add_argument("--num-predict", type=int, default=8192,
+                    help="plafond de tokens générés par réponse ; évite qu'une génération "
+                         "en boucle consomme tout le budget (défaut 8192)")
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--keep-alive", default="15m")
@@ -1930,7 +2092,14 @@ def main() -> int:
                     help="saute l'appel de préchauffage (inutile et facturé sur une API distante)")
     ap.add_argument("--self-test", action="store_true",
                     help="vérifie les tests cachés avec les solutions de référence puis sort")
+    ap.add_argument("-v", "--verbose", action="count", default=0,
+                    help="affiche les prompts envoyés au modèle, ses réponses, les outils "
+                         "déclarés, ceux qu'il demande et leur résultat ; -vv ajoute le "
+                         "contexte complet de chaque tour, les raisonnements, et ne tronque rien")
     args = ap.parse_args()
+
+    global VERBOSE
+    VERBOSE = args.verbose
 
     if not args.host.startswith("http"):
         args.host = "http://" + args.host
@@ -1964,9 +2133,10 @@ def main() -> int:
         sys.exit("indique au moins un modèle : --models qwen3.6:35b-mlx")
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
 
-    ollama = Ollama(args.host, args.num_ctx, args.temperature, args.seed, args.keep_alive)
+    ollama = Ollama(args.host, args.num_ctx, args.temperature, args.seed, args.keep_alive,
+                    args.num_predict)
     litellm = LiteLLM(args.litellm_base_url, args.litellm_api_key, args.temperature,
-                      args.seed, extra_body)
+                      args.seed, args.num_predict, extra_body)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = RUNS_DIR / stamp
@@ -1985,6 +2155,7 @@ def main() -> int:
         "cargo_timeout": args.cargo_timeout,
         "max_turns": args.max_turns,
         "num_ctx": args.num_ctx,
+        "num_predict": args.num_predict,
         "temperature": args.temperature,
         "seed": args.seed,
         "agent_protocol": args.agent_protocol,
@@ -2025,7 +2196,10 @@ def main() -> int:
                 slug = f"{label}__{task.key}__{mode}".replace(":", "_").replace("/", "-")
                 workdir = out_dir / slug
                 workdir.mkdir(parents=True, exist_ok=True)
-                print(f"▶ {label} · {task.key} · {mode} …", end="", flush=True)
+                # en verbeux les blocs de trace s'intercalent : la ligne d'état
+                # ne peut plus rester ouverte en attendant son verdict.
+                print(f"▶ {label} · {task.key} · {mode} …",
+                      end="\n" if VERBOSE else "", flush=True)
                 deadline = Deadline(args.task_timeout)
                 if backend == "claude" and mode == "direct":
                     r = run_direct_cli(model, task, workdir, target_dir,
@@ -2041,7 +2215,7 @@ def main() -> int:
                                     args.cargo_timeout, args.max_turns, args.agent_protocol,
                                     label)
                 results.append(r)
-                print(f" {STATUS_ICON.get(r.status, r.status)} "
+                print(f"{'▶ ' if VERBOSE else ' '}{STATUS_ICON.get(r.status, r.status)} "
                       f"{r.passed}/{r.total} en {r.wall_s:.0f}s "
                       f"({r.gen_tokens} tok, {r.tok_s:.1f} tok/s, {r.turns} tour(s))",
                       flush=True)

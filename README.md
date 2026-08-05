@@ -103,6 +103,7 @@ Options utiles :
 | `--litellm-api-key` | `$LITELLM_API_KEY`, sinon `$OPENAI_API_KEY` | envoyée en `Authorization: Bearer` |
 | `--litellm-extra-body` | — | JSON fusionné dans chaque requête, ex. `'{"num_ctx": 16384}'` |
 | `--no-warmup` | — | saute l'appel de préchauffage (inutile et facturé sur une API distante) |
+| `-v` / `--verbose` | — | trace les prompts envoyés, les réponses, les outils déclarés, ceux que le modèle demande et leur résultat ; `-vv` ajoute le contexte complet de chaque tour, les raisonnements, et ne tronque plus rien |
 
 ## Les deux modes
 
@@ -176,6 +177,11 @@ claude -p --model <m> --system-prompt <mes prompts> --output-format json
 ne dépende pas de ta configuration locale. Le prompt passe par **stdin** : les
 options `--tools` et `--allowed-tools` sont variadiques et avaleraient un prompt
 placé en argument positionnel.
+
+Avec `-v`, le harnais demande au CLI `--output-format stream-json --verbose` au
+lieu de `json` : le flux JSONL laisse voir les outils demandés tour par tour, et
+sa dernière ligne reste l'objet `type: result` d'où viennent les métriques —
+elles ne changent pas.
 
 Trois réserves, reprises dans chaque rapport :
 
