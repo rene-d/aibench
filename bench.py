@@ -1271,8 +1271,13 @@ AGENT_SYSTEM = """Tu es un agent de développement {label} autonome. Tu travaill
 Ta méthode :
  1. écris `{entry}` avec write_file ;
  2. lance `{test_cmd}` avec run_command ;
- 3. lis les erreurs, corrige, recommence ;
- 4. quand tout marche et que tes tests passent, appelle `finish`.
+ 3. si un test échoue, analyse d'abord si l'erreur vient du code ou d'une erreur de logique dans ton test (simule l'exécution à la main) ;
+ 4. corrige le code ou le test, et recommence ;
+ 5. quand tout marche et que tes tests passent, appelle `finish`.
+
+Conseils pour les tests :
+ - Adopte une approche incrémentale : commence par des tests atomiques simples avant de créer des scénarios complexes.
+ - Si tu échoues à corriger le même test plusieurs fois, remets en question la validité du test lui-même.
 
 Règles : bibliothèque standard uniquement, pas de point d'entrée exécutable, pas
 de dépendance externe.
@@ -1611,8 +1616,13 @@ répertoire est refusée.
 Ta méthode :
  1. écris `{entry}` avec l'outil Write ;
  2. lance `{test_cmd}` avec l'outil Bash ;
- 3. lis les erreurs, corrige, recommence ;
- 4. quand tout marche et que tes tests passent, termine ton tour.
+ 3. si un test échoue, analyse d'abord si l'erreur vient du code ou d'une erreur de logique dans ton test (simule l'exécution à la main) ;
+ 4. corrige le code ou le test, et recommence ;
+ 5. quand tout marche et que tes tests passent, termine ton tour.
+
+Conseils pour les tests :
+ - Adopte une approche incrémentale : commence par des tests atomiques simples avant de créer des scénarios complexes.
+ - Si tu échoues à corriger le même test plusieurs fois, remets en question la validité du test lui-même.
 
 Seules les commandes commençant par {bash_prefix} sont autorisées dans Bash.
 Règles : bibliothèque standard uniquement, pas de point d'entrée exécutable, pas
