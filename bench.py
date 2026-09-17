@@ -1925,6 +1925,25 @@ def report(results: list[Result], out_dir: Path, config: dict) -> str:
                          f"`{json.dumps(config['litellm_extra_body'], ensure_ascii=False)}`")
     lines.append("")
 
+    fiches = config.get("model_details") or {}
+    if fiches:
+        lines.append("## Modèles\n")
+        lines.append("| modèle | archi | paramètres | quantisation | format | contexte natif "
+                     "| taille | empreinte | capacités |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        for nom, f in sorted(fiches.items()):
+            lines.append(
+                f"| `{nom}` | {f.get('architecture') or '?'} | {f.get('parameter_size') or '?'} "
+                f"| {f.get('quantization') or '?'} | {f.get('format') or '?'} "
+                f"| {humain_contexte(f.get('context_length', 0))} "
+                f"| {humain_octets(f.get('size_bytes', 0))} "
+                f"| `{f.get('digest') or '?'}` "
+                f"| {', '.join(f.get('capabilities') or []) or '?'} |")
+        lines.append("")
+        lines.append("> Relevé par `/api/show` au début du run : le nom d'un tag ne suffit "
+                     "pas à identifier des poids, l'empreinte si.\n")
+        lines.append("")
+
     lines.append("## Résultats détaillés\n")
     lines.append("| modèle | tâche | mode | statut | tests | temps | LLM | cargo | "
                  "tok gén | tok/s | tours | outils | LOC |")
@@ -2043,6 +2062,91 @@ def self_test(tasks: list[Task], target_dir: Path, cargo_timeout: float) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def api_json(url: str, payload: dict | None = None, timeout: float = 20.0) -> dict:
+    """GET — ou POST si `payload` — d'une API JSON. Lève en cas d'échec."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def parametres_modelfile(texte: str) -> dict:
+    """`temperature 0.6\ntop_p 0.95` → dict. Les `stop` sont omis : trop nombreux."""
+    defauts = {}
+    for ligne in texte.splitlines():
+        cle, _, valeur = ligne.strip().partition(" ")
+        valeur = valeur.strip().strip('"')
+        if cle and valeur and cle != "stop":
+            defauts[cle] = valeur
+    return defauts
+
+
+def fiche_modele(brut: dict, tag: dict) -> dict:
+    """Ce qu'on garde d'un `/api/show` : de quoi identifier des poids sans ambiguïté.
+
+    `brut` vient de `/api/show`, `tag` de `/api/tags` (taille sur disque et
+    empreinte, que `show` ne donne pas). Les champs vides sont écartés : une
+    fiche ne doit pas promettre ce que le serveur n'a pas dit.
+    """
+    details = brut.get("details") or {}
+    infos = brut.get("model_info") or {}
+    arch = infos.get("general.architecture") or details.get("family") or ""
+    fiche = {
+        "family": details.get("family") or "",
+        "architecture": arch,
+        "parameter_size": details.get("parameter_size") or "",
+        "parameter_count": infos.get("general.parameter_count") or 0,
+        "quantization": details.get("quantization_level") or "",
+        "format": details.get("format") or "",
+        "context_length": infos.get(f"{arch}.context_length") or 0,
+        "size_bytes": tag.get("size") or 0,
+        "digest": (tag.get("digest") or "").removeprefix("sha256:")[:12],
+        "modified_at": tag.get("modified_at") or "",
+        "capabilities": brut.get("capabilities") or [],
+        "defaults": parametres_modelfile(brut.get("parameters") or ""),
+    }
+    return {cle: valeur for cle, valeur in fiche.items() if valeur}
+
+
+def sonder_modeles(host: str, modeles: list[str], timeout: float = 20.0) -> dict[str, dict]:
+    """La fiche `ollama show` de chaque modèle, consignée avec les mesures.
+
+    Sans elle, deux runs de `gemma4:31b` peuvent porter le même nom et des poids
+    différents (quantisation refaite, tag repoussé) : la comparaison ne veut
+    alors plus rien dire. Silencieux sur échec — un serveur injoignable ou trop
+    vieux pour `/api/show` ne doit pas empêcher le benchmark de tourner.
+    """
+    host = host.rstrip("/")
+    try:
+        catalogue = api_json(f"{host}/api/tags", timeout=timeout).get("models") or []
+    except Exception:
+        catalogue = []
+    tags = {m.get("model") or m.get("name"): m for m in catalogue}
+
+    fiches = {}
+    for modele in dict.fromkeys(modeles):
+        try:
+            brut = api_json(f"{host}/api/show", {"model": modele}, timeout)
+        except Exception as exc:
+            print(f"   ⚠️  fiche de {modele} indisponible : {type(exc).__name__}: {exc}")
+            continue
+        # un nom nu vaut `:latest`, que `/api/tags` écrit en toutes lettres
+        tag = tags.get(modele) or tags.get(f"{modele}:latest") or {}
+        fiches[modele] = fiche_modele(brut, tag)
+    return fiches
+
+
+def humain_octets(n: int) -> str:
+    return f"{n / 1e9:.1f} Go" if n else "?"
+
+
+def humain_contexte(n: int) -> str:
+    if not n:
+        return "?"
+    return f"{n // 1024} k" if n % 1024 == 0 else str(n)
+
+
 def machine_info() -> str:
     rc, out, _, _ = run_cmd(["sysctl", "-n", "machdep.cpu.brand_string"], ROOT, 5)
     cpu = out.strip() if rc == 0 else "?"
@@ -2071,6 +2175,9 @@ def main() -> int:
                     help="ex: rle,lru ou rust/rle,python/asn1_ber (défaut : toutes)")
     ap.add_argument("--lang", default="", help="rust, python, ou les deux (défaut)")
     ap.add_argument("--modes", default="direct,agentic")
+    ap.add_argument("--no-show", action="store_true",
+                    help="ne pas consigner la fiche `ollama show` des modèles "
+                         "(quantisation, contexte natif, taille, empreinte)")
     ap.add_argument("--host", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
     ap.add_argument("--backend", default="ollama", choices=["ollama", "litellm"],
                     help="backend des modèles sans préfixe (défaut : ollama)")
@@ -2170,6 +2277,15 @@ def main() -> int:
         "seed": args.seed,
         "agent_protocol": args.agent_protocol,
     }
+    # les poids réellement mesurés, tant qu'on a le serveur sous la main
+    a_sonder = [modele for spec in models
+                for backend_spec, modele in [split_backend(spec, args.backend)]
+                if backend_spec == "ollama"]
+    if a_sonder and not args.no_show:
+        fiches = sonder_modeles(args.host, a_sonder)
+        if fiches:
+            config["model_details"] = fiches
+
     print(f"Sortie : {out_dir}\nMachine : {config['machine']}\n")
 
     results: list[Result] = []

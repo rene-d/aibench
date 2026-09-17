@@ -13,7 +13,14 @@ que le résultat **le plus récent**, et seulement à machine, hôte et backend
 identiques — deux mesures faites sur des machines ou des backends différents ne
 s'écrasent pas, elles sont rapportées côte à côte.
 
-Le tableau met un modèle par colonne et un test (tâche × mode) par ligne.
+Un seul mode est rapporté, `agentic` par défaut : c'est le seul qui exerce la
+boucle d'outils, et mêler les deux doublait la hauteur du tableau pour des
+mesures qui ne se comparent pas. `--mode direct` rapporte l'autre.
+
+Chaque contexte de mesure donne deux vues : un **classement**, un modèle par
+ligne, et le **détail** tâche par tâche, un modèle par colonne — par paquets de
+quelques modèles, quitte à tenir sur plusieurs pages, plutôt qu'un seul tableau
+illisible quand les modèles se comptent par dizaines.
 """
 
 from __future__ import annotations
@@ -28,25 +35,39 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 RUNS = ROOT / "runs"
-MODES = ("direct", "agentic")
+# fiches relevées après coup, quand les runs n'en portent pas : {hôte: {modèle: fiche}}
+CACHE = RUNS / "_modeles.json"
+MODES = ("agentic", "direct")
+MODE_DEFAUT = "agentic"
 
-# libellé et couleur par statut : en PDF, un mot coloré se lit mieux qu'un
-# émoji, qui manquerait de toute façon dans les polices par défaut de Typst
+# au-delà, les colonnes deviennent trop étroites pour une cellule d'une ligne :
+# on repart sur un nouveau tableau, page suivante s'il le faut
+MODELES_PAR_TABLEAU = 6
+
+# libellé, couleur du texte, teinte de fond et explication par statut : en PDF,
+# un mot coloré se lit mieux qu'un émoji, qui manquerait de toute façon dans les
+# polices par défaut de Typst ; la teinte donne la carte de chaleur qui permet
+# de repérer un modèle ou une tâche d'un coup d'œil, sans lire les cellules
 STATUT = {
-    "pass": ("OK", '#1a7f37'),
-    "fail": ("KO tests", '#c0392b'),
-    "compile_error": ("KO compil", '#b35309'),
-    "no_code": ("KO vide", '#6b6b6b'),
-    "timeout": ("KO délai", '#8a6d1f'),
-    "error": ("KO backend", '#7d3c98'),
+    "pass":          ("OK",         "#1a7f37", "#e8f4ea", "tous les tests passent"),
+    "fail":          ("KO tests",   "#c0392b", "#fdeceb", "des tests échouent"),
+    "compile_error": ("KO compil",  "#b35309", "#fdf1e4", "ne compile pas"),
+    "no_code":       ("KO vide",    "#6b6b6b", "#f2f2f2", "aucun code produit"),
+    "timeout":       ("KO délai",   "#8a6d1f", "#faf4de", "délai dépassé"),
+    "error":         ("KO backend", "#7d3c98", "#f6eefa", "erreur du backend"),
 }
-INCONNU = ("KO ?", '#6b6b6b')
+INCONNU = ("KO ?", "#6b6b6b", "#f2f2f2", "statut inconnu")
 # statuts qui ne valent pas la peine d'afficher un score de tests
 SANS_SCORE = {"no_code", "error"}
 
 # séquences d'échappement reconnues par Typst ; les noms de tâches contiennent
 # des « _ », qui sinon passeraient pour de l'italique
 ECHAPPES = {c: "\\" + c for c in "\\#$*_`<>@~[]"}
+# espace fine insécable, pour les milliers et devant « % »
+FINE = " "
+# césure possible mais invisible : un nom de modèle sans tiret déborderait sinon
+# de sa colonne au lieu de passer à la ligne
+COUPURE = "\\u{200b}"
 
 
 # --------------------------------------------------------------------------- #
@@ -86,9 +107,14 @@ def lire(run: Path) -> tuple[dict, list] | None:
         return None
 
 
-def collecter(runs: list[Path]) -> dict[tuple, dict]:
-    """Une ligne par (machine, hôte, backend, modèle, tâche, mode) : la plus récente."""
+def collecter(runs: list[Path]) -> tuple[dict[tuple, dict], dict[tuple, dict]]:
+    """Les mesures les plus récentes, et la fiche des modèles qui les ont produites.
+
+    Une mesure par (machine, hôte, backend, modèle, tâche, mode) ; une fiche par
+    (machine, hôte, backend, modèle), relevée par `ollama show` au début du run.
+    """
     retenus: dict[tuple, dict] = {}
+    fiches: dict[tuple, dict] = {}
     for run in sorted(runs, key=datation):  # du plus ancien au plus récent
         lu = lire(run)
         if lu is None:
@@ -96,6 +122,7 @@ def collecter(runs: list[Path]) -> dict[tuple, dict]:
         config, resultats = lu
         machine = config.get("machine") or "?"
         host = config.get("host") or "?"
+        details = config.get("model_details") or {}
         for r in resultats:
             modele, tache, mode = r.get("model"), r.get("task"), r.get("mode")
             if not (modele and tache and mode):
@@ -103,21 +130,97 @@ def collecter(runs: list[Path]) -> dict[tuple, dict]:
             r = dict(r, _run=run.name, _machine=machine, _host=host,
                      _backend=backend_effectif(modele, config))
             retenus[(machine, host, r["_backend"], modele, tache, mode)] = r
-    return retenus
+            if details.get(modele):
+                fiches[(machine, host, r["_backend"], modele)] = details[modele]
+    return retenus, fiches
 
 
 # --------------------------------------------------------------------------- #
-# Rendu
+# Fiches de modèles : celles des runs, complétées à la demande par le serveur
+# --------------------------------------------------------------------------- #
+
+def lire_cache() -> dict:
+    """Le cache des fiches sondées après coup : {hôte: {modèle: fiche}}."""
+    try:
+        return json.loads(CACHE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[recap] {CACHE} illisible : {type(exc).__name__}: {exc}", file=sys.stderr)
+        return {}
+
+
+def sonder(retenus: dict[tuple, dict], fiches: dict[tuple, dict]) -> dict:
+    """Demande au serveur Ollama la fiche des modèles qu'aucun run n'a consignée.
+
+    Les runs d'avant `--no-show` n'ont rien gardé des poids mesurés ; plutôt que
+    de tout refaire tourner, on interroge le serveur maintenant et on garde la
+    réponse dans `runs/_modeles.json`, réutilisable quand il sera éteint.
+    """
+    try:
+        from bench import sonder_modeles  # même sonde qu'à l'exécution du bench
+    except Exception as exc:
+        print(f"[recap] sonde indisponible ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return lire_cache()
+
+    manquants: dict[str, set] = {}
+    for r in retenus.values():
+        if r["_backend"] != "ollama":
+            continue  # litellm et le CLI Claude ne servent pas de fiche
+        if (r["_machine"], r["_host"], r["_backend"], r["model"]) not in fiches:
+            manquants.setdefault(r["_host"], set()).add(r["model"])
+
+    cache = lire_cache()
+    trouves = 0
+    for host, modeles in sorted(manquants.items()):
+        print(f"[recap] sonde {host} : {len(modeles)} modèle(s) sans fiche…", file=sys.stderr)
+        releve = sonder_modeles(host, sorted(modeles))
+        trouves += len(releve)
+        if releve:
+            cache.setdefault(host, {}).update(releve)
+    if trouves:
+        CACHE.write_text(json.dumps(cache, indent=1, ensure_ascii=False, sort_keys=True) + "\n",
+                         encoding="utf-8")
+        print(f"[recap] {trouves} fiche(s) → {CACHE}", file=sys.stderr)
+    elif manquants:
+        print("[recap] aucune fiche relevée (serveur injoignable ?)", file=sys.stderr)
+    return cache
+
+
+# --------------------------------------------------------------------------- #
+# Mise en forme des valeurs
 # --------------------------------------------------------------------------- #
 
 def duree(secondes: float) -> str:
     # arrondi d'abord, sinon 3599,6 s donnerait « 59m60 »
     minutes, reste = divmod(round(secondes), 60)
-    return f"{reste}s" if not minutes else f"{minutes}m{reste:02d}"
+    if minutes < 60:
+        return f"{reste}s" if not minutes else f"{minutes}m{reste:02d}"
+    heures, minutes = divmod(minutes, 60)
+    return f"{heures}h{minutes:02d}"
 
 
 def tours(n: int) -> str:
     return f"{n} tour" if n == 1 else f"{n} tours"
+
+
+def entier(n: int) -> str:
+    """12345 → « 12 345 », l'espace étant fine et insécable."""
+    return f"{n:,}".replace(",", FINE)
+
+
+def part(numerateur: float, denominateur: float) -> str:
+    return f"{100 * numerateur / denominateur:.0f}{FINE}%" if denominateur else "—"
+
+
+def octets(n: int) -> str:
+    return f"{n / 1e9:.1f} Go" if n else "—"
+
+
+def contexte(n: int) -> str:
+    if not n:
+        return "—"
+    return f"{n // 1024} k" if n % 1024 == 0 else entier(n)
 
 
 def typ(texte) -> str:
@@ -125,42 +228,74 @@ def typ(texte) -> str:
     return "".join(ECHAPPES.get(c, c) for c in str(texte))
 
 
-def mono(texte) -> str:
+def mono(texte, coupable: bool = False) -> str:
     """Nom de modèle ou de tâche, en chasse fixe (chaîne Typst, pas du markup)."""
     litteral = str(texte).replace("\\", "\\\\").replace('"', '\\"')
+    if coupable:  # Typst ne coupe que sur les tirets : offrons-lui les autres
+        for c in ":/._":
+            litteral = litteral.replace(c, c + COUPURE)
     return f'#raw("{litteral}")'
 
 
-def cellule(r: dict | None) -> str:
-    """`OK · 12/12 · 45s · 3 tours`, le statut coloré disant *pourquoi* si KO."""
-    if r is None:
-        return "—"
-    libelle, couleur = STATUT.get(r.get("status", ""), INCONNU)
-    bouts = [f'#text(fill: rgb("{couleur}"))[{typ(libelle)}]']
-    if r.get("status") not in SANS_SCORE and r.get("total"):
-        bouts.append(f"{r.get('passed', 0)}/{r['total']}")
-    bouts.append(duree(r.get("wall_s", 0.0)))
-    if r.get("turns"):
-        bouts.append(tours(r["turns"]))
-    return " · ".join(bouts)
+def gris(texte: str, taille: float = 7.0) -> str:
+    return f'#text(size: {taille}pt, fill: luma(110))[{texte}]'
 
+
+def barre_empilee(mesures: list[dict], largeur: float = 5.4) -> str:
+    """Le profil d'un modèle : la part de chaque statut, dans l'ordre de la légende."""
+    total = len(mesures) or 1
+    comptes = {statut: sum(1 for r in mesures if r.get("status") == statut)
+               for statut in STATUT}
+    segments = [(comptes[s], STATUT[s][1]) for s in STATUT if comptes[s]]
+    reste = total - sum(comptes.values())  # statuts sortis depuis cette version
+    if reste > 0:
+        segments.append((reste, INCONNU[1]))
+    boites = ", ".join(f'box(width: {n / total * largeur:.3f}cm, height: 6pt, '
+                       f'fill: rgb("{couleur}"))' for n, couleur in segments)
+    return f"#stack(dir: ltr, {boites})"
+
+
+def cel(contenu: str, fond: str | None = None, portee: int = 1) -> str:
+    """Une cellule Typst, éventuellement teintée ou étendue sur plusieurs colonnes."""
+    options = []
+    if portee > 1:
+        options.append(f"colspan: {portee}")
+    if fond:
+        options.append(f'fill: rgb("{fond}")')
+    if options:
+        return f'table.cell({", ".join(options)})[{contenu}]'
+    return f"[{contenu}]"
+
+
+def cellule(r: dict | None) -> str:
+    """`OK 12/12` puis, en gris, `45s · 3 tours` — le statut disant *pourquoi* si KO."""
+    if r is None:
+        return cel('#text(fill: luma(170))[—]')
+    libelle, couleur, teinte, _ = STATUT.get(r.get("status", ""), INCONNU)
+    tete = [f'#text(fill: rgb("{couleur}"), weight: "bold")[{typ(libelle)}]']
+    if r.get("status") not in SANS_SCORE and r.get("total"):
+        tete.append(f"{r.get('passed', 0)}/{r['total']}")
+    pied = [duree(r.get("wall_s", 0.0))]
+    if r.get("turns"):
+        pied.append(tours(r["turns"]))
+    return cel(" ".join(tete) + "#linebreak()" + gris(" · ".join(pied)), teinte)
+
+
+# --------------------------------------------------------------------------- #
+# Rendu
+# --------------------------------------------------------------------------- #
 
 def tableau(lignes: list[str], entetes: list[str], corps: list[list[str]],
-            fixes: int, secable: bool = True) -> None:
-    """Un tableau Typst : `fixes` colonnes de gauche au plus juste, le reste réparti."""
-    colonnes = ", ".join(["auto"] * fixes + ["1fr"] * (len(entetes) - fixes))
-    # le tableau de cumuls tient toujours sur une page : le couper y laisserait une
-    # ou deux lignes orphelines. `breakable` est une propriété du bloc, pas du tableau.
-    if not secable:
-        lignes.append("#block(breakable: false)[")
+            colonnes: str, alignement: str | None = None) -> None:
+    """Un tableau Typst ; l'en-tête se répète en haut de chaque page enjambée."""
     lignes.append("#table(")
     lignes.append(f"  columns: ({colonnes}),")
-    lignes.append("  table.header(" + ", ".join(f"[{c}]" for c in entetes) + "),")
+    if alignement:
+        lignes.append(f"  align: {alignement},")
+    lignes.append("  table.header(" + ", ".join(entetes) + "),")
     for ligne in corps:
-        lignes.append("  " + ", ".join(f"[{c}]" for c in ligne) + ",")
+        lignes.append("  " + ", ".join(ligne) + ",")
     lignes.append(")")
-    if not secable:
-        lignes.append("]")
     lignes.append("")
 
 
@@ -169,34 +304,201 @@ PREAMBULE = '''// Document engendré par recap.py — ne pas éditer à la main.
 #set page(
   paper: "a4",
   flipped: true,
-  margin: 1.2cm,
+  margin: (x: 1.1cm, top: 1.1cm, bottom: 1.0cm),
+  // les tableaux enjambent les pages : un rappel du contexte évite de remonter
+  header: context {
+    let titres = query(selector(heading.where(level: 2)).before(here()))
+    if counter(page).get().first() > 1 and titres.len() > 0 {
+      align(right, text(size: 7pt, fill: luma(150))[#titres.last().body])
+    }
+  },
   footer: context align(center, text(size: 7pt, fill: luma(120))[
     #counter(page).display("1 / 1", both: true)
   ]),
 )
-#set text(size: 8pt, lang: "fr")
+#set text(size: 8.5pt, lang: "fr")
+#set par(leading: 0.5em)
 #set table(
-  stroke: 0.4pt + luma(200),
-  inset: 5pt,
-  fill: (_, y) => if y == 0 { luma(238) },
+  stroke: 0.4pt + luma(210),
+  inset: (x: 5pt, y: 4.5pt),
+  fill: (_, y) => if y == 0 { luma(236) },
 )
-#show table.cell.where(y: 0): strong
-#show heading.where(level: 1): it => block(below: 0.8em)[#text(size: 15pt)[#it.body]]
-#show heading.where(level: 2): it => block(above: 1.6em, below: 0.7em)[
-  #text(size: 11pt)[#it.body]
+// sans cela, une ligne coupée par un saut de page laisse sa moitié basse
+// orpheline en haut de la suivante, sous l'en-tête répété
+#set table.cell(breakable: false)
+#show table.cell.where(y: 0): set text(size: 7.5pt, weight: "bold")
+#show heading.where(level: 1): it => block(below: 0.8em)[#text(size: 16pt)[#it.body]]
+#show heading.where(level: 2): it => block(above: 1.8em, below: 0.9em)[
+  #text(size: 12pt)[#it.body]
+  #v(-0.55em)
+  #line(length: 100%, stroke: 0.6pt + luma(175))
+]
+#show heading.where(level: 3): it => block(above: 1.3em, below: 0.6em)[
+  #text(size: 9.5pt, fill: luma(55))[#it.body]
 ]
 '''
 
 
-def recapitulatif(retenus: dict[tuple, dict], modes: tuple[str, ...]) -> str:
+def agreger(mesures: list[dict]) -> dict:
+    """Les cumuls d'un modèle (ou d'une tâche) sur un lot de mesures."""
+    return {
+        "mesures": len(mesures),
+        "ok": sum(1 for r in mesures if r.get("status") == "pass"),
+        "passes": sum(r.get("passed", 0) or 0 for r in mesures),
+        "tests": sum(r.get("total", 0) or 0 for r in mesures),
+        "temps": sum(r.get("wall_s", 0.0) or 0.0 for r in mesures),
+        "tours": sum(r.get("turns", 0) or 0 for r in mesures),
+        "tokens": sum(r.get("gen_tokens", 0) or 0 for r in mesures),
+        "cout": sum(r.get("cost_usd", 0.0) or 0.0 for r in mesures),
+    }
+
+
+def classer(lot: dict[tuple, dict], modeles: list[str]) -> tuple[list[str], dict]:
+    """Les modèles du meilleur au moins bon, avec leurs cumuls."""
+    bilans = {m: agreger([r for r in lot.values() if r["model"] == m]) for m in modeles}
+    ordre = sorted(modeles, key=lambda m: (
+        -bilans[m]["ok"] / (bilans[m]["mesures"] or 1),   # taux de tâches réussies
+        -bilans[m]["passes"] / (bilans[m]["tests"] or 1),  # puis finesse des tests
+        bilans[m]["temps"],                                # puis rapidité
+        m,
+    ))
+    return ordre, bilans
+
+
+def rendre_classement(out: list[str], lot: dict[tuple, dict], modeles: list[str],
+                      bilans: dict, fiches: dict) -> None:
+    """Un modèle par ligne : la vue qui répond à « lequel prendre ? »."""
+    avec_tokens = any(bilans[m]["tokens"] for m in modeles)
+    avec_cout = any(bilans[m]["cout"] for m in modeles)
+    mesures = {m: [r for r in lot.values() if r["model"] == m] for m in modeles}
+
+    # les deux chiffres qu'on veut sous les yeux en comparant : le reste des
+    # poids est dans la section « Modèles mesurés »
+    avec_fiches = any(fiches.get(m) for m in modeles)
+    entetes = ["[\\#]", "[modèle]"]
+    colonnes = ["auto", "1fr"]
+    if avec_fiches:
+        entetes += ["[paramètres]", "[quantisation]"]
+        colonnes += ["auto", "auto"]
+    entetes += ["[tâches réussies]", "[tests passés]", "[taux]",
+                "[temps cumulé]", "[temps moyen]", "[tours]"]
+    colonnes += ["auto", "auto", "auto", "auto", "auto", "auto"]
+    if avec_tokens:
+        entetes.append("[tokens générés]")
+        colonnes.append("auto")
+    if avec_cout:
+        entetes.append("[coût]")
+        colonnes.append("auto")
+    entetes.append("[profil des statuts]")
+    colonnes.append("auto")
+
+    corps = []
+    for rang, modele in enumerate(modeles, 1):
+        b = bilans[modele]
+        f = fiches.get(modele) or {}
+        ligne = [
+            cel(gris(str(rang), 8.0)),
+            cel(mono(modele, coupable=True)),
+        ]
+        if avec_fiches:
+            ligne.append(cel(typ(f.get("parameter_size") or "—")))
+            ligne.append(cel(mono(f["quantization"]) if f.get("quantization") else "—"))
+        ligne += [
+            cel(f'{b["ok"]}/{b["mesures"]}'),
+            cel(f'{b["passes"]}/{b["tests"]}' if b["tests"] else "—"),
+            cel(part(b["passes"], b["tests"])),
+            cel(duree(b["temps"])),
+            cel(duree(b["temps"] / b["mesures"]) if b["mesures"] else "—"),
+            cel(entier(b["tours"])),
+        ]
+        if avec_tokens:
+            ligne.append(cel(entier(b["tokens"])))
+        if avec_cout:
+            ligne.append(cel(f'{b["cout"]:.2f} \\$' if b["cout"] else "—"))
+        ligne.append(cel(barre_empilee(mesures[modele])))
+        corps.append(ligne)
+
+    tableau(out, entetes, corps, ", ".join(colonnes),
+            alignement="(x, y) => if x == 1 { left + horizon } else { right + horizon }")
+
+
+def rendre_fiches(out: list[str], modeles: list[str], fiches: dict) -> None:
+    """Les poids derrière les noms : quantisation, contexte natif, taille, empreinte."""
+    if not any(fiches.get(m) for m in modeles):
+        return
+    out.append("=== Modèles mesurés")
+    out.append("")
+
+    corps = []
+    for modele in modeles:
+        f = fiches.get(modele) or {}
+        defauts = " ".join(f"{cle} {valeur}" for cle, valeur in (f.get("defaults") or {}).items())
+        corps.append([
+            cel(mono(modele, coupable=True)),
+            cel(typ(f.get("architecture") or f.get("family") or "—")),
+            cel(typ(f.get("parameter_size") or "—")),
+            cel(mono(f["quantization"]) if f.get("quantization") else "—"),
+            cel(typ(f.get("format") or "—")),
+            cel(contexte(f.get("context_length", 0))),
+            cel(octets(f.get("size_bytes", 0))),
+            cel(mono(f["digest"]) if f.get("digest") else "—"),
+            cel(gris(typ(", ".join(f.get("capabilities") or [])) or "—", 7.5)),
+            cel(gris(mono(defauts) if defauts else "—", 7.5)),
+        ])
+    entetes = ["[modèle]", "[archi]", "[paramètres]", "[quantisation]", "[format]",
+               "[contexte natif]", "[taille]", "[empreinte]", "[capacités]",
+               "[réglages du modelfile]"]
+    tableau(out, entetes, corps, "auto, auto, auto, auto, auto, auto, auto, auto, auto, 1fr",
+            alignement="(x, y) => if x == 0 or x >= 8 { left + horizon } "
+                       "else { right + horizon }")
+    out.append(gris("Relevé par `ollama show` (`/api/show`) : le nom d'un tag ne suffit pas "
+                    "à identifier des poids, l'empreinte si. Les réglages du modelfile sont "
+                    "ceux que le benchmark ne fixe pas lui-même.", 7.5))
+    out.append("")
+
+
+def rendre_detail(out: list[str], lot: dict[tuple, dict], modeles: list[str],
+                  taches: list[str], par_tableau: int) -> None:
+    """Une tâche par ligne, un modèle par colonne, par paquets de `par_tableau`."""
+    par_cle = {(r["model"], r["task"]): r for r in lot.values()}
+    reussites = {t: sum(1 for m in modeles
+                        if (par_cle.get((m, t)) or {}).get("status") == "pass")
+                 for t in taches}
+
+    for debut in range(0, len(modeles), par_tableau):
+        paquet = modeles[debut:debut + par_tableau]
+        fin = debut + len(paquet)
+        if len(modeles) > par_tableau:
+            out.append(gris(f"Modèles {debut + 1} à {fin} sur {len(modeles)}, "
+                            f"dans l'ordre du classement.", 8.0))
+            out.append("")
+
+        corps, langue_courante = [], None
+        for tache in taches:
+            langue = tache.split("/")[0] if "/" in tache else "—"
+            if langue != langue_courante:  # un intertitre par langage : le tableau
+                langue_courante = langue   # est long, autant le baliser
+                corps.append([cel(f'#text(weight: "bold", fill: luma(70))[{typ(langue)}]',
+                                  fond="#f4f4f4", portee=len(paquet) + 1)])
+            entete = (mono(tache.split("/", 1)[-1], coupable=True) + "#linebreak()"
+                      + gris(f'{reussites[tache]}/{len(modeles)} modèles', 6.5))
+            corps.append([cel(entete)] + [cellule(par_cle.get((m, tache))) for m in paquet])
+
+        entetes = ["[tâche]"] + [f"[{mono(m, coupable=True)}]" for m in paquet]
+        tableau(out, entetes, corps, "3.1cm, " + ", ".join(["1fr"] * len(paquet)),
+                alignement="left + horizon")
+
+
+def recapitulatif(retenus: dict[tuple, dict], fiches: dict[tuple, dict], cache: dict,
+                  mode: str, par_tableau: int) -> str:
     out = [PREAMBULE, "= Récapitulatif des runs", ""]
     if not retenus:
         out.append("_Aucun résultat._")
         return "\n".join(out) + "\n"
 
     engendre = datetime.now().strftime("%Y-%m-%d %H:%M")
-    out.append(f"#text(fill: luma(100))[Engendré le {engendre} · "
-               f"{len(retenus)} mesures retenues]")
+    out.append(gris(f"Engendré le {engendre} · mode {typ(mode)} · "
+                    f"{len(retenus)} mesures retenues", 8.0))
     out.append("")
 
     # une section par contexte de mesure : mélanger les machines ou les backends
@@ -205,60 +507,45 @@ def recapitulatif(retenus: dict[tuple, dict], modes: tuple[str, ...]) -> str:
     for machine, host, backend in contextes:
         lot = {k: r for k, r in retenus.items()
                if (r["_machine"], r["_host"], r["_backend"]) == (machine, host, backend)}
-        modeles = sorted({r["model"] for r in lot.values()})
         taches = sorted({r["task"] for r in lot.values()})
-        # une ligne par test, c'est-à-dire par couple (tâche, mode) mesuré
-        essais = [(t, m) for t in taches for m in modes
-                  if any(r["task"] == t and r["mode"] == m for r in lot.values())]
+        modeles, bilans = classer(lot, sorted({r["model"] for r in lot.values()}))
 
-        out.append(f"== {typ(backend)} — {typ(machine)}")
+        # `machine` vaut « ?, ? RAM » quand bench.py n'a rien pu sonder : autant
+        # titrer avec l'hôte, qui lui est toujours renseigné
+        connue = machine.replace("?", "").replace("RAM", "").strip(" ,")
+        lieu = machine if connue else host.split("://", 1)[-1].rstrip("/")
+        out.append(f"== {typ(backend)} — {typ(lieu)}")
         out.append("")
-        out.append(f"#text(fill: luma(100))[Hôte : {mono(host)} · {len(modeles)} modèle(s) · "
-                   f"{len(taches)} tâche(s) · {len(lot)} mesure(s) retenue(s)]")
+        out.append(gris(f"Hôte : {mono(host)} · mode {typ(mode)} · {len(modeles)} modèle(s) · "
+                        f"{len(taches)} tâche(s) · {len(lot)} mesure(s) retenue(s)", 8.0))
         out.append("")
 
-        par_cle = {(r["model"], r["task"], r["mode"]): r for r in lot.values()}
-        corps = []
-        for tache, mode in essais:
-            ligne = [mono(tache), typ(mode)]
-            for modele in modeles:
-                ligne.append(cellule(par_cle.get((modele, tache, mode))))
-            corps.append(ligne)
-        tableau(out, ["tâche", "mode"] + [mono(m) for m in modeles], corps, fixes=2)
+        fiches_lot = {m: (fiches.get((machine, host, backend, m))
+                          or cache.get(host, {}).get(m) or {}) for m in modeles}
 
-        # totaux, dans le même sens de lecture : un modèle par colonne
-        corps = []
-        for mode in modes:
-            par_modele = {m: [r for r in lot.values() if r["model"] == m and r["mode"] == mode]
-                          for m in modeles}
-            if not any(par_modele.values()):
-                continue
-            for intitule, calcul in (
-                ("tâches OK", lambda v: f"{sum(1 for r in v if r.get('status') == 'pass')}/{len(v)}"),
-                ("tests passés", lambda v: (f"{sum(r.get('passed', 0) for r in v)}"
-                                            f"/{sum(r.get('total', 0) for r in v)}"
-                                            if sum(r.get("total", 0) for r in v) else "—")),
-                ("temps cumulé", lambda v: duree(sum(r.get("wall_s", 0.0) for r in v))),
-                ("tours cumulés", lambda v: str(sum(r.get("turns", 0) or 0 for r in v))),
-            ):
-                corps.append([typ(mode), typ(intitule)]
-                             + [calcul(par_modele[m]) if par_modele[m] else "—" for m in modeles])
-        cumuls = {m: [r for r in lot.values() if r["model"] == m] for m in modeles}
-        corps.append(["", "tokens générés"]
-                     + [str(sum(r.get("gen_tokens", 0) or 0 for r in cumuls[m])) for m in modeles])
-        couts = {m: sum(r.get("cost_usd", 0.0) or 0.0 for r in cumuls[m]) for m in modeles}
-        corps.append(["", "coût"]
-                     + [f"{couts[m]:.2f} \\$" if couts[m] else "—" for m in modeles])
-        tableau(out, ["mode", "cumul"] + [mono(m) for m in modeles], corps, fixes=2,
-                secable=False)
+        out.append("=== Classement des modèles")
+        out.append("")
+        rendre_classement(out, lot, modeles, bilans, fiches_lot)
+        rendre_fiches(out, modeles, fiches_lot)
 
-    legende = " · ".join(f'#text(fill: rgb("{c}"))[{typ(l)}] {mono(statut)}'
-                         for statut, (l, c) in STATUT.items())
-    out.append(f"#text(size: 7pt)[Légende : {legende}]")
+        out.append("=== Détail tâche par tâche")
+        out.append("")
+        rendre_detail(out, lot, modeles, taches, par_tableau)
+
+    out.append("=== Légende")
     out.append("")
-    out.append("#text(size: 7pt)[Chaque cellule est la mesure #strong[la plus récente] pour ce "
-               "couple (modèle, tâche, mode) sur cette machine, cet hôte et ce backend, au "
-               "format `statut · tests passés/total · temps mur · tours`.]")
+    legende = ", ".join(
+        f'#box(fill: rgb("{teinte}"), inset: (x: 3pt, y: 1.5pt), radius: 2pt, outset: (y: 1pt))'
+        f'[#text(fill: rgb("{couleur}"), weight: "bold")[{typ(libelle)}]] {typ(explication)}'
+        for libelle, couleur, teinte, explication in STATUT.values())
+    out.append(f"#text(size: 7.5pt)[{legende}. Ces mêmes couleurs composent, dans cet "
+               "ordre, le profil des statuts du classement.]")
+    out.append("")
+    out.append("#text(size: 7.5pt)[Chaque cellule est la mesure #strong[la plus récente] pour ce "
+               "couple (modèle, tâche) sur cette machine, cet hôte et ce backend, au format "
+               "`statut · tests passés/total`, puis `temps mur · tours` en gris. Les modèles "
+               "sont classés par part de tâches réussies, puis par part de tests passés, puis "
+               "par temps cumulé.]")
     out.append("")
     return "\n".join(out) + "\n"
 
@@ -299,11 +586,21 @@ def main() -> int:
     ap.add_argument("--backend", help="ne garder que ce backend (ollama, litellm, claude-cli)")
     ap.add_argument("--models", help="modèles à garder, séparés par des virgules")
     ap.add_argument("--tasks", help="tâches à garder, séparées par des virgules")
-    ap.add_argument("--mode", choices=MODES, help="ne garder qu'un mode")
+    ap.add_argument("--mode", choices=MODES, default=MODE_DEFAUT,
+                    help=f"mode rapporté (défaut : {MODE_DEFAUT})")
+    ap.add_argument("--modeles-par-tableau", type=int, default=MODELES_PAR_TABLEAU,
+                    metavar="N", help="colonnes de modèles par tableau de détail "
+                                      f"(défaut : {MODELES_PAR_TABLEAU})")
+    ap.add_argument("--sonder", action="store_true",
+                    help="interroger les serveurs Ollama pour la fiche des modèles "
+                         "qu'aucun run n'a consignée, et la garder dans runs/_modeles.json")
     ap.add_argument("--print", dest="afficher", action="store_true",
                     help="afficher la source Typst sur la sortie standard")
     ap.add_argument("--no-pdf", action="store_true", help="écrire le .typ sans compiler")
     args = ap.parse_args()
+
+    if args.modeles_par_tableau < 1:
+        sys.exit("--modeles-par-tableau doit valoir au moins 1")
 
     if args.runs:
         dossiers = [Path(a) if Path(a).is_dir() else RUNS / a for a in args.runs]
@@ -315,7 +612,7 @@ def main() -> int:
     else:
         sys.exit(f"{RUNS} n'existe pas")
 
-    retenus = collecter(dossiers)
+    retenus, fiches = collecter(dossiers)
 
     modeles = set(args.models.split(",")) if args.models else None
     taches = set(args.tasks.split(",")) if args.tasks else None
@@ -325,13 +622,13 @@ def main() -> int:
         "_backend": lambda v: args.backend is None or args.backend.lower() in v.lower(),
         "model": lambda v: modeles is None or v in modeles,
         "task": lambda v: taches is None or v in taches,
-        "mode": lambda v: args.mode is None or v == args.mode,
+        "mode": lambda v: v == args.mode,
     }
     retenus = {k: r for k, r in retenus.items()
                if all(test(r.get(champ, "")) for champ, test in filtres.items())}
 
-    modes = (args.mode,) if args.mode else MODES
-    texte = recapitulatif(retenus, modes)
+    cache = sonder(retenus, fiches) if args.sonder else lire_cache()
+    texte = recapitulatif(retenus, fiches, cache, args.mode, args.modeles_par_tableau)
 
     source = Path(args.out)
     source.parent.mkdir(parents=True, exist_ok=True)

@@ -341,6 +341,17 @@ Par couple (modèle, tâche, mode) :
   cargo, actions malformées, est-ce que ses propres tests passaient
 - **code** : lignes non vides produites
 
+Et, une fois par run, la **fiche de chaque modèle Ollama**, relevée par
+`ollama show` (`/api/show`) : architecture, nombre de paramètres, quantisation,
+format, contexte natif, taille sur disque, empreinte, capacités et réglages du
+modelfile que le benchmark ne fixe pas lui-même (`top_k`, `top_p`, `min_p`…).
+Sans elle, deux runs de `gemma4:31b` peuvent porter le même nom et des poids
+différents — un tag repoussé, une quantisation refaite — et la comparaison ne
+veut plus rien dire : le nom d'un tag n'identifie rien, l'empreinte si.
+`--no-show` s'en passe. Les runs d'avant cette fiche se rattrapent après coup
+avec `recap.py --sonder`, qui interroge le serveur et garde les réponses dans
+`runs/_modeles.json`.
+
 Le modèle est préchargé (warm-up) avant la première tâche pour que le temps de
 chargement des poids ne pollue pas les mesures. Sur un backend `litellm:` le
 warm-up ne sert plus qu'à valider tôt l'endpoint et la clé — `--no-warmup` le
@@ -361,7 +372,8 @@ runs/<horodatage>/
 ```
 
 Le rapport est réécrit après **chaque** couple : interrompre le benchmark ne
-fait rien perdre.
+fait rien perdre. `report.md` s'ouvre sur la fiche des modèles mesurés, et
+`results.json` la garde sous `config.model_details`.
 
 ### Récapitulatif de tous les runs
 
@@ -372,17 +384,53 @@ fait rien perdre.
 ```bash
 python3 recap.py                                  # runs/recapitulatif.typ + .pdf
 python3 recap.py --backend ollama --mode direct   # filtres
+python3 recap.py --modeles-par-tableau 4          # colonnes par tableau de détail
 python3 recap.py --no-pdf --print                 # source Typst sur stdout
 ```
 
-Un modèle par colonne, un test (tâche × mode) par ligne, une cellule
-`statut · tests passés/total · temps · tours`. Le statut est coloré et dit
-*pourquoi* c'est KO : `KO tests`, `KO compil`, `KO délai`, `KO backend`,
-`KO vide`. Une section par contexte de mesure — mélanger deux machines ou deux
-backends dans un même tableau ferait comparer ce qui n'est pas comparable.
+Un seul mode est rapporté, **`agentic` par défaut** : c'est celui qui exerce la
+boucle d'outils, et mêler les deux doublait la hauteur du tableau pour des
+mesures qui ne se comparent pas. `--mode direct` rapporte l'autre.
+
+Chaque contexte de mesure donne deux vues. Le **classement** met un modèle par
+ligne — tâches réussies, tests passés, temps, tours, tokens, et un profil en
+barre empilée des statuts. Le **détail** met une tâche par ligne et un modèle
+par colonne, par paquets de six modèles (`--modeles-par-tableau`) dans l'ordre
+du classement : plutôt que d'écraser vingt colonnes sur une page, le tableau
+s'étend sur plusieurs, l'en-tête se répétant en haut de chacune.
+
+Le classement porte les paramètres et la quantisation de chaque modèle, et une
+section **Modèles mesurés** détaille les poids derrière les noms (contexte
+natif, taille, empreinte, capacités, réglages du modelfile) — pour les runs qui
+en portent la fiche, ou après un `recap.py --sonder`.
+
+Une cellule vaut `statut · tests passés/total`, puis `temps · tours` en gris ;
+le statut est coloré, teinte le fond de la cellule et dit *pourquoi* c'est KO :
+`KO tests`, `KO compil`, `KO délai`, `KO backend`, `KO vide`. Une section par
+contexte de mesure — mélanger deux machines ou deux backends dans un même
+tableau ferait comparer ce qui n'est pas comparable.
 
 `compare.py` reste utile pour l'autre question : confronter deux runs précis, en
 markdown.
+
+### Mettre un modèle de côté
+
+Un modèle essayé puis abandonné, ou mesuré deux fois sous deux tags (un tag nu
+et son `:latest`, par exemple) encombre le récapitulatif sans rien lui
+apprendre. `archive.py` le met de côté sans rien perdre :
+
+```bash
+python3 archive.py --models muse-glimmer:latest,qwen3.8:27b -n   # simulation
+python3 archive.py --models muse-glimmer:latest,qwen3.8:27b      # archivage
+python3 archive.py --liste                                       # l'inventaire
+python3 archive.py --restaurer --models qwen3.8:27b              # marche arrière
+```
+
+Les mesures et leurs dossiers de travail partent dans `runs/_archive/<run>/` ;
+`bench.py`, `compare.py` et `recap.py` ignorent les dossiers commençant par `_`.
+Un run dont plus rien ne reste part en entier, `report.md` compris ; un run
+seulement écorné garde son `report.md` d'origine, qui décrit alors des mesures
+sorties de son `results.json`.
 
 ## Limites connues
 
