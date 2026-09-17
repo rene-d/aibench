@@ -49,6 +49,8 @@ RUNS_DIR = ROOT / "runs"
 # sous-dossier d'une tâche contenant les jeux de données à analyser ; recopié tel
 # quel à la racine du projet, en mode direct comme en mode agentique
 DATA_DIR = "data"
+START_DIR = "depart"   # fichiers déposés dans le projet avant l'arrivée de l'agent
+FIXED_DIR = "corrige"  # modules compagnons de la référence, pour l'auto-test
 
 CARGO_TOML = """[package]
 name = "task"
@@ -438,6 +440,23 @@ def note_abort(reply: LlmReply, exc: BaseException, timeout: float) -> None:
         reply.abort_reason = f"flux interrompu : {type(exc).__name__}: {exc}"
 
 
+# Ollama rend une 5xx quand son propre gabarit n'arrive pas à relire l'appel
+# d'outil produit par le modèle (`XML syntax error…`, wrapper manquant…). C'est
+# le serveur qui trébuche, pas le modèle qui refuse les outils — mais la
+# conséquence est la même, et le protocole texte, lui, marche. Sept mesures de
+# nemotron-3-super:120b ont été perdues faute de le reconnaître.
+PARSE_TOOL_KO = re.compile(
+    r"syntax error|unexpected EOF|closed by|does not support tools|"
+    r"tool call|function_calls|wrapper|template", re.I)
+
+
+def tool_parse_failure(body: str, code: int) -> bool:
+    """Le serveur n'a pas su fabriquer ou relire un appel d'outil ?"""
+    if "does not support tools" in body:
+        return True
+    return code >= 400 and bool(PARSE_TOOL_KO.search(body))
+
+
 class Ollama:
     def __init__(self, host: str, num_ctx: int, temperature: float, seed: int, keep_alive: str,
                  num_predict: int):
@@ -480,7 +499,7 @@ class Ollama:
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="replace")
-            if "does not support tools" in body or "tools" in body and exc.code == 400:
+            if tool_parse_failure(body, exc.code):
                 raise ToolsUnsupported(body) from exc
             raise OllamaError(f"HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
@@ -538,10 +557,11 @@ class Ollama:
 
     # --- mise en forme des messages de la boucle agentique ------------------ #
 
-    def assistant_msg(self, reply: LlmReply) -> dict:
+    def assistant_msg(self, reply: LlmReply, calls: list | None = None) -> dict:
         msg = {"role": "assistant", "content": reply.content}
-        if reply.tool_calls:
-            msg["tool_calls"] = reply.tool_calls[:1]
+        calls = reply.tool_calls[:1] if calls is None else calls
+        if calls:
+            msg["tool_calls"] = calls
         return msg
 
     def tool_msg(self, call: dict, name: str, output: str) -> dict:
@@ -724,12 +744,13 @@ class LiteLLM:
 
     # --- mise en forme des messages de la boucle agentique ------------------ #
 
-    def assistant_msg(self, reply: LlmReply) -> dict:
+    def assistant_msg(self, reply: LlmReply, calls: list | None = None) -> dict:
         msg = {"role": "assistant"}
-        if reply.content or not reply.tool_calls:
+        calls = reply.tool_calls[:1] if calls is None else calls
+        if reply.content or not calls:
             msg["content"] = reply.content
-        if reply.tool_calls:
-            msg["tool_calls"] = reply.tool_calls[:1]
+        if calls:
+            msg["tool_calls"] = calls
         return msg
 
     def tool_msg(self, call: dict, name: str, output: str) -> dict:
@@ -767,6 +788,9 @@ class Lang:
     write_paths: str    # chemins que l'agent a le droit d'écrire, pour les prompts
 
     def scaffold(self, project: Path, source: str) -> None: ...
+    def prepare_agent(self, project: Path) -> list[list[str]]:
+        """Commandes à passer une fois avant que l'agent ne prenne la main."""
+        return []
     def extras(self, project: Path) -> list[Path]: ...
     def collect(self, project: Path) -> str: ...
     def env(self, target_dir: Path) -> dict: return {}
@@ -903,17 +927,22 @@ class CLang(Lang):
               "    src/*.h           (tu peux ajouter tes propres en-têtes)\n"
               "    tests/harness.h   (fourni : macros TEST(nom) et CHECK_*)\n"
               "    tests/*.c         (tu peux y écrire tes propres tests)\n"
+              "    build/            (déjà configuré par cmake : ne le reconfigure pas)\n"
               "\n"
-              "  Configure une fois avec `cmake -S . -B build`, puis compile avec\n"
-              "  `cmake --build build` et lance `ctest --test-dir build "
-              "--output-on-failure`.\n"
+              "  Compile et teste en une seule commande :\n"
+              "  `cmake --build build && ctest --test-dir build --output-on-failure`.\n"
               "  Compilation en C11 avec -Wall -Wextra et "
               "-fsanitize=address,undefined : une\n"
               "  erreur mémoire ou un comportement indéfini fait échouer le test.")
-    test_cmd = "ctest --test-dir build --output-on-failure"
-    allowed_cmds = ("cmake -S . -B build, cmake --build build, "
-                    "ctest --test-dir build --output-on-failure, ./build/<exécutable>")
+    test_cmd = "cmake --build build && ctest --test-dir build --output-on-failure"
+    allowed_cmds = ("cmake --build build, ctest --test-dir build --output-on-failure, "
+                    "./build/<exécutable> — chaînables avec `&&`")
     write_paths = "src/*.c, src/*.h, tests/*.c, tests/*.h"
+
+    def prepare_agent(self, project):
+        # la configuration cmake ne dépend pas du code : la faire une fois ici
+        # épargne à l'agent un tour entier, et deux de plus quand elle échoue
+        return [["cmake", "-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Debug"]]
 
     def scaffold(self, project, source):
         (project / "src").mkdir(parents=True, exist_ok=True)
@@ -979,7 +1008,7 @@ LANGS = {l.name: l for l in (RustLang(), PythonLang(), CLang())}
 
 @dataclass
 class Grade:
-    status: str = "fail"  # pass | fail | compile_error | no_code | timeout
+    status: str = "fail"  # pass | fail | compile_error | no_code | timeout | turns
     passed: int = 0
     total: int = 0
     compiled: bool = False
@@ -1001,13 +1030,31 @@ def install_data(task: "Task", project: Path) -> None:
         shutil.copyfile(src, dest_dir / src.name)
 
 
+def install_start(task: "Task", project: Path) -> None:
+    """Pose les fichiers fournis par la tâche dans le projet de l'agent.
+
+    Le fichier d'entrée est déjà écrit par le scaffold ; le reste — modules
+    existants, tests visibles — arrive ici.
+    """
+    for rel, contenu in task.start_files.items():
+        if rel == task.lang.entry:
+            continue
+        dest = project / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(contenu)
+
+
 def project_layout(task: "Task") -> str:
-    """Arborescence annoncée à l'agent, augmentée des données de la tâche."""
-    if not task.data_files:
-        return task.lang.layout
-    names = ", ".join(f"{DATA_DIR}/{p.name}" for p in task.data_files)
-    return (f"{task.lang.layout}\n"
-            f"    {DATA_DIR + '/':<18}(fourni, à analyser, à ne pas modifier : {names})")
+    """Arborescence annoncée à l'agent, augmentée des fichiers de la tâche."""
+    lignes = [task.lang.layout]
+    if task.data_files:
+        names = ", ".join(f"{DATA_DIR}/{p.name}" for p in task.data_files)
+        lignes.append(f"    {DATA_DIR + '/':<18}(fourni, à analyser, à ne pas modifier : "
+                      f"{names})")
+    for rel in sorted(task.start_files):
+        note = "fourni, protégé : ne pas modifier" if rel in task.proteges else "fourni"
+        lignes.append(f"    {rel:<18}({note})")
+    return "\n".join(lignes)
 
 
 def grade(task: "Task", source: str, workdir: Path, target_dir: Path, timeout: float) -> Grade:
@@ -1079,6 +1126,11 @@ class Task:
     n_tests: int
     extra_sources: list = field(default_factory=list)
     data_files: list = field(default_factory=list)
+    # fichiers posés dans le projet avant que l'agent n'arrive : du code à
+    # réparer, des modules qui existent déjà, un test visible à respecter
+    start_files: dict = field(default_factory=dict)
+    proteges: tuple = ()
+    kind: str = "greenfield"
 
     @property
     def key(self) -> str:
@@ -1104,6 +1156,20 @@ def load_tasks(names: list[str] | None, langs: list[str] | None) -> list[Task]:
             tests_src = (d / "tests").with_suffix(Path(lang.test_path).suffix).read_text()
             reference = (d / "reference").with_suffix(Path(lang.entry).suffix).read_text()
             data_dir = d / DATA_DIR
+            manifeste = {}
+            if (d / "task.json").is_file():
+                manifeste = json.loads((d / "task.json").read_text(encoding="utf-8"))
+            depart = d / START_DIR
+            start_files = {}
+            if depart.is_dir():
+                for f in sorted(depart.rglob("*")):
+                    if f.is_file():
+                        start_files[str(f.relative_to(depart))] = f.read_text()
+            # les modules compagnons de la référence : sans eux, l'auto-test
+            # d'une tâche multi-fichiers n'aurait rien à importer
+            corrige = d / FIXED_DIR
+            extras = sorted(f for f in corrige.glob("*") if f.is_file()) \
+                if corrige.is_dir() else []
             tasks.append(Task(
                 name=d.name,
                 lang=lang,
@@ -1113,6 +1179,10 @@ def load_tasks(names: list[str] | None, langs: list[str] | None) -> list[Task]:
                 n_tests=lang.count_tests(tests_src),
                 data_files=(sorted(p for p in data_dir.iterdir() if p.is_file())
                             if data_dir.is_dir() else []),
+                extra_sources=extras,
+                start_files=start_files,
+                proteges=tuple(manifeste.get("proteges") or ()),
+                kind=manifeste.get("type") or ("reparation" if start_files else "greenfield"),
             ))
     if names:
         missing = set(names) - matched
@@ -1269,32 +1339,67 @@ AGENT_SYSTEM = """Tu es un agent de développement {label} autonome. Tu travaill
 {layout}
 
 Ta méthode :
- 1. écris `{entry}` avec write_file ;
- 2. lance `{test_cmd}` avec run_command ;
+ 1. écris `{entry}` avec {outil_ecrire} ;
+ 2. lance `{test_cmd}` avec {outil_commande} ;
  3. si un test échoue, analyse d'abord si l'erreur vient du code ou d'une erreur de logique dans ton test (simule l'exécution à la main) ;
  4. corrige le code ou le test, et recommence ;
- 5. quand tout marche et que tes tests passent, appelle `finish`.
+ 5. quand tout marche et que tes tests passent, appelle `{outil_finir}`.
+
+Pour une retouche ponctuelle, préfère {outil_editer} à une réécriture complète :
+c'est plus sûr et bien moins coûteux sur un fichier long.
 
 Conseils pour les tests :
  - Adopte une approche incrémentale : commence par des tests atomiques simples avant de créer des scénarios complexes.
  - Si tu échoues à corriger le même test plusieurs fois, remets en question la validité du test lui-même.
 
 Règles : bibliothèque standard uniquement, pas de point d'entrée exécutable, pas
-de dépendance externe.
+de dépendance externe.{proteges}
 Ton code sera ensuite noté par une suite de tests cachée conforme à la
 spécification : respecte scrupuleusement les signatures demandées.
-Tu as {max_turns} tours maximum. N'appelle qu'un outil à la fois."""
+Tu as {max_turns} tours maximum. {cadence}"""
+
+PROTEGES_RAPPEL = """
+Les fichiers suivants sont fournis par l'énoncé et **ne doivent pas être
+modifiés** — ils font partie du contrat, pas de ta solution : {liste}."""
 
 AGENT_USER = "Voici la tâche à réaliser.\n\n{spec}\n\nCommence maintenant."
 
-def build_tools(lang: Lang) -> list:
-    tools = json.loads(json.dumps(TOOLS))  # copie profonde
+# Deux harnais, deux dialectes. `cc` imite Claude Code : appels d'outils
+# natifs, plusieurs par tour, un shell qui accepte `&&`. `kilo` imite
+# kilocode/Roo : balises XML dans le texte, une seule action par message,
+# `apply_diff` plutôt qu'une réécriture. Le même modèle sous les deux profils
+# dit ce que coûte le harnais — ce que mesurer un seul des deux cache.
+PROFILS = {
+    "cc": {
+        "outil_ecrire": "write_file", "outil_editer": "edit_file",
+        "outil_commande": "run_command", "outil_finir": "finish",
+        "cadence": ("Tu peux demander plusieurs outils dans un même tour, et chaîner "
+                    "des commandes avec `&&`."),
+        "appels_par_tour": 4,
+        "outils": ("write_file", "edit_file", "read_file", "list_files",
+                   "run_command", "finish"),
+    },
+    "kilo": {
+        "outil_ecrire": "write_to_file", "outil_editer": "apply_diff",
+        "outil_commande": "execute_command", "outil_finir": "attempt_completion",
+        "cadence": "N'utilise qu'un seul outil par message, et attends son résultat.",
+        "appels_par_tour": 1,
+        "outils": (),   # protocole XML : les outils sont décrits dans le prompt
+    },
+}
+
+def build_tools(lang: Lang, noms: tuple = ()) -> list:
+    tools = [t for t in json.loads(json.dumps(TOOLS))  # copie profonde
+             if not noms or t["function"]["name"] in noms]
     fn = {t["function"]["name"]: t["function"] for t in tools}
     fn["write_file"]["description"] = (
         f"Écrit (ou écrase) un fichier du projet. Chemins autorisés : {lang.write_paths}")
     fn["write_file"]["parameters"]["properties"]["path"]["description"] = (
         f"chemin relatif, ex: {lang.entry}")
-    fn["run_command"]["description"] = f"Exécute une commande. Autorisé : {lang.allowed_cmds}."
+    fn["edit_file"]["parameters"]["properties"]["path"]["description"] = (
+        f"chemin relatif, ex: {lang.entry}")
+    fn["run_command"]["description"] = (f"Exécute une commande, ou une chaîne `a && b`. "
+                                        f"Autorisé : {lang.allowed_cmds}.")
     fn["run_command"]["parameters"]["properties"]["command"]["description"] = (
         f"ex: {lang.test_cmd}")
     return tools
@@ -1314,6 +1419,34 @@ TOOLS = [
                 },
                 "required": ["path", "content"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": ("Remplace un extrait exact et unique d'un fichier. À préférer à "
+                            "write_file pour une retouche : moins de tokens, moins de risque "
+                            "de casser le reste du fichier."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "chemin relatif"},
+                    "old": {"type": "string",
+                            "description": "extrait à remplacer, copié au caractère près ; "
+                                           "il doit apparaître une seule fois dans le fichier"},
+                    "new": {"type": "string", "description": "texte de remplacement"},
+                },
+                "required": ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "Liste les fichiers du projet.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -1354,21 +1487,42 @@ TOOLS = [
     },
 ]
 
-MAX_TOOL_OUTPUT = 3500
+MAX_TOOL_OUTPUT = 6000   # une sortie de tests tronquée trop tôt cache l'échec
+MAX_CHAINE = 4           # commandes enchaînées par `&&` dans un seul appel
+
+
+def clip_output(out: str) -> str:
+    """Garde la tête et la queue : l'erreur est presque toujours à l'une des deux."""
+    if len(out) <= MAX_TOOL_OUTPUT:
+        return out
+    moitie = MAX_TOOL_OUTPUT // 2
+    coupe = len(out) - MAX_TOOL_OUTPUT
+    return f"{out[:moitie]}\n[...{coupe} caractères coupés...]\n{out[-moitie:]}"
 
 
 class Sandbox:
     """Exécute les outils de l'agent dans son projet, avec allowlist par langage."""
 
-    def __init__(self, project: Path, lang: Lang, target_dir: Path, cargo_timeout: float):
+    def __init__(self, project: Path, lang: Lang, target_dir: Path, cargo_timeout: float,
+                 proteges: tuple = ()):
         self.project = project
         self.lang = lang
         self.target_dir = target_dir
         self.cargo_timeout = cargo_timeout
+        # fichiers fournis que la tâche interdit de toucher : y toucher est une
+        # tentative, pas un accident, et c'est ce qu'on veut mesurer
+        self.proteges = {str(Path(p)) for p in proteges}
         self.writes = 0
+        self.edits = 0
+        self.edit_failed = 0
         self.commands = 0
+        self.denials = 0
         self.cargo_s = 0.0
         self.last_test_ok = False
+
+    def _refus(self, message: str) -> str:
+        self.denials += 1
+        return f"ERREUR: {message}"
 
     def _rel(self, path: str) -> tuple[Path, Path] | None:
         p = (self.project / path).resolve()
@@ -1381,39 +1535,107 @@ class Sandbox:
         path, content = args.get("path", ""), args.get("content", "")
         hit = self._rel(path)
         if hit is None or not self.lang.write_ok(hit[1]):
-            return f"ERREUR: chemin refusé '{path}'."
+            return self._refus(f"chemin refusé '{path}'.")
+        if str(hit[1]) in self.proteges:
+            return self._refus(f"'{path}' est fourni par l'énoncé et ne doit pas être "
+                               f"modifié. Corrige le code, pas le contrat.")
         p = hit[0]
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         self.writes += 1
         return f"OK: {path} écrit ({len(content.splitlines())} lignes)."
 
+    def edit_file(self, args: dict) -> str:
+        """Remplacement d'un extrait exact et unique — l'édition de Claude Code.
+
+        Réécrire 300 lignes pour en changer trois coûte le contexte et le temps
+        de génération ; et rater un remplacement est un échec mesurable, pas une
+        fatalité silencieuse.
+        """
+        path = args.get("path", "")
+        ancien = args.get("old") or args.get("old_string") or ""
+        nouveau = args.get("new") or args.get("new_string") or ""
+        hit = self._rel(path)
+        if hit is None or not self.lang.write_ok(hit[1]):
+            return self._refus(f"chemin refusé '{path}'.")
+        if str(hit[1]) in self.proteges:
+            return self._refus(f"'{path}' est fourni par l'énoncé et ne doit pas être "
+                               f"modifié. Corrige le code, pas le contrat.")
+        p = hit[0]
+        if not p.is_file():
+            self.edit_failed += 1
+            return f"ERREUR: '{path}' n'existe pas — écris-le d'abord avec write_file."
+        if not ancien:
+            self.edit_failed += 1
+            return "ERREUR: `old` est vide. Donne l'extrait exact à remplacer."
+        contenu = p.read_text()
+        vus = contenu.count(ancien)
+        if vus == 0:
+            self.edit_failed += 1
+            return ("ERREUR: extrait introuvable dans " + path +
+                    ". Relis le fichier : l'extrait doit être identique au caractère près.")
+        if vus > 1:
+            self.edit_failed += 1
+            return (f"ERREUR: extrait présent {vus} fois dans {path}. "
+                    f"Allonge-le jusqu'à ce qu'il soit unique.")
+        p.write_text(contenu.replace(ancien, nouveau, 1))
+        self.edits += 1
+        delta = len(nouveau.splitlines()) - len(ancien.splitlines())
+        return f"OK: {path} modifié ({delta:+d} ligne(s))."
+
     def read_file(self, args: dict) -> str:
         hit = self._rel(args.get("path", ""))
         if hit is None:
-            return "ERREUR: chemin refusé."
+            return self._refus("chemin refusé.")
         p = hit[0]
         if not p.is_file():
             return "ERREUR: fichier inexistant."
-        return p.read_text()[:MAX_TOOL_OUTPUT]
+        return clip_output(p.read_text())
+
+    def list_files(self, args: dict) -> str:
+        """L'inventaire du projet : indispensable dès qu'une tâche fournit du code."""
+        racine = self.project
+        fichiers = sorted(q.relative_to(racine) for q in racine.rglob("*")
+                          if q.is_file() and "build" not in q.parts
+                          and "target" not in q.parts and "__pycache__" not in q.parts)
+        lignes = []
+        for rel in fichiers:
+            marque = "  (fourni, protégé)" if str(rel) in self.proteges else ""
+            lignes.append(f"{rel}{marque}")
+        return clip_output("\n".join(lignes) or "(projet vide)")
 
     def run_command(self, args: dict, budget: float) -> str:
+        """Une commande, ou une chaîne `a && b` — comme dans un vrai terminal.
+
+        Sans le chaînage, configurer, compiler puis tester coûte trois tours en
+        C pour un seul en Rust : on mesurait le build, pas le modèle.
+        """
         cmd = (args.get("command") or "").strip()
-        argv = self.lang.normalise_cmd(cmd.split())
-        if argv is None:
-            return f"ERREUR: commande refusée '{cmd}'. Autorisé : {self.lang.allowed_cmds}"
-        rc, out, secs, killed = run_cmd(
-            argv, self.project, min(self.cargo_timeout, max(5.0, budget)),
-            self.lang.env(self.target_dir),
-        )
-        self.commands += 1
-        self.cargo_s += secs
-        if "test" in " ".join(argv):
-            self.last_test_ok = rc == 0
-        head = f"$ {' '.join(argv)}\n(exit {rc}, {secs:.1f}s)\n"
-        if len(out) > MAX_TOOL_OUTPUT:
-            out = out[:MAX_TOOL_OUTPUT // 2] + "\n[...tronqué...]\n" + out[-MAX_TOOL_OUTPUT // 2:]
-        return head + out
+        etapes = [e.strip() for e in cmd.split("&&") if e.strip()][:MAX_CHAINE]
+        if not etapes:
+            return self._refus("commande vide.")
+        sorties, debut = [], time.monotonic()
+        for etape in etapes:
+            argv = self.lang.normalise_cmd(etape.split())
+            if argv is None:
+                return self._refus(f"commande refusée '{etape}'. "
+                                   f"Autorisé : {self.lang.allowed_cmds}")
+            reste = budget - (time.monotonic() - debut)
+            rc, out, secs, killed = run_cmd(
+                argv, self.project, min(self.cargo_timeout, max(5.0, reste)),
+                self.lang.env(self.target_dir),
+            )
+            self.commands += 1
+            self.cargo_s += secs
+            if "test" in " ".join(argv):
+                self.last_test_ok = rc == 0
+            sorties.append(f"$ {' '.join(argv)}\n(exit {rc}, {secs:.1f}s)\n{out}")
+            if rc != 0:  # `&&` : la chaîne s'arrête au premier échec
+                if len(etapes) > 1:
+                    sorties.append(f"[chaîne interrompue : {len(etapes) - len(sorties)} "
+                                   f"commande(s) non lancée(s)]")
+                break
+        return clip_output("\n".join(sorties))
 
     def collect_sources(self) -> str:
         return self.lang.collect(self.project)
@@ -1438,13 +1660,90 @@ Pour lancer une commande :
 ACTION: run_command
 CMD: {test_cmd}
 
+Pour retoucher un fichier sans le réécrire :
+ACTION: edit_file
+PATH: {entry}
+<<<<<<< SEARCH
+<extrait exact à remplacer>
+=======
+<texte de remplacement>
+>>>>>>> REPLACE
+
+Pour lister les fichiers :
+ACTION: list_files
+
 Pour terminer :
 ACTION: finish
+"""
+
+# Le dialecte de kilocode/Roo : des balises XML dans le texte, une action par
+# message. Ce n'est pas un détail de forme — c'est le protocole sous lequel ces
+# modèles sont réellement utilisés en local, et celui où ils trébuchent.
+KILO_PROTOCOL = """Tu utilises des outils en XML. Un seul outil par message, et tu attends
+son résultat avant le suivant.
+
+<write_to_file>
+<path>{entry}</path>
+<content>
+<contenu complet du fichier>
+</content>
+</write_to_file>
+
+<apply_diff>
+<path>{entry}</path>
+<diff>
+<<<<<<< SEARCH
+<extrait exact à remplacer>
+=======
+<texte de remplacement>
+>>>>>>> REPLACE
+</diff>
+</apply_diff>
+
+<read_file>
+<path>{entry}</path>
+</read_file>
+
+<list_files>
+</list_files>
+
+<execute_command>
+<command>{test_cmd}</command>
+</execute_command>
+
+Quand tout passe :
+<attempt_completion>
+<result>ce que tu as fait</result>
+</attempt_completion>
 """
 
 ACTION_RE = re.compile(r"ACTION:\s*(\w+)", re.I)
 PATH_RE = re.compile(r"PATH:\s*(\S+)", re.I)
 CMD_RE = re.compile(r"CMD:\s*(.+)", re.I)
+# `<<<<<<< SEARCH … ======= … >>>>>>> REPLACE`, avec l'indice de ligne
+# facultatif des versions récentes de Roo
+SEARCH_REPLACE = re.compile(
+    r"<{3,9}\s*SEARCH[^\n]*\n"
+    r"(?::start_line:\s*\d+\s*\n)?"
+    r"(?:-{3,}[^\n]*\n)?"
+    r"(.*?)\n"
+    r"={3,9}[^\n]*\n"
+    r"(.*?)\n?"
+    r">{3,9}\s*REPLACE", re.S)
+KILO_TAGS = (
+    ("write_to_file", "write_file"),
+    ("apply_diff", "edit_file"),
+    ("read_file", "read_file"),
+    ("list_files", "list_files"),
+    ("execute_command", "run_command"),
+    ("attempt_completion", "finish"),
+)
+
+
+def balise(nom: str, texte: str) -> str | None:
+    """Le contenu de `<nom>…</nom>`, sans analyseur XML : ça contient du code."""
+    m = re.search(rf"<{nom}>[ \t]*\n?(.*?)\n?[ \t]*</{nom}>", texte, re.S)
+    return m.group(1) if m else None
 
 
 def parse_text_action(text: str, lang: Lang) -> tuple[str, dict]:
@@ -1453,9 +1752,18 @@ def parse_text_action(text: str, lang: Lang) -> tuple[str, dict]:
     action = (m.group(1).lower() if m else "")
     if action == "finish":
         return "finish", {}
+    if action == "list_files":
+        return "list_files", {}
     if action == "run_command":
         c = CMD_RE.search(text)
         return "run_command", {"command": c.group(1).strip() if c else lang.test_cmd}
+    sr = SEARCH_REPLACE.search(text)
+    if action == "edit_file" or (sr and action != "write_file"):
+        if not sr:
+            return "", {}
+        p = PATH_RE.search(text)
+        return "edit_file", {"path": p.group(1).strip() if p else lang.entry,
+                             "old": sr.group(1), "new": sr.group(2)}
     code = extract_code(text, lang)
     if action == "write_file" or code:
         p = PATH_RE.search(text)
@@ -1463,23 +1771,62 @@ def parse_text_action(text: str, lang: Lang) -> tuple[str, dict]:
     return "", {}
 
 
+def parse_kilo_action(text: str, lang: Lang) -> tuple[str, dict]:
+    """La première balise d'outil du message — kilocode n'en accepte qu'une."""
+    text = strip_thinking(text)
+    trouves = [(text.index(f"<{tag}>"), tag, nom) for tag, nom in KILO_TAGS
+               if f"<{tag}>" in text]
+    if not trouves:
+        return "", {}
+    _, tag, nom = min(trouves)
+    corps = balise(tag, text) or ""
+    chemin = (balise("path", corps) or lang.entry).strip()
+    if nom == "write_file":
+        return nom, {"path": chemin, "content": balise("content", corps) or ""}
+    if nom == "edit_file":
+        sr = SEARCH_REPLACE.search(balise("diff", corps) or corps)
+        if not sr:
+            return "", {}
+        return nom, {"path": chemin, "old": sr.group(1), "new": sr.group(2)}
+    if nom == "run_command":
+        return nom, {"command": (balise("command", corps) or lang.test_cmd).strip()}
+    if nom == "read_file":
+        return nom, {"path": chemin}
+    return nom, {}
+
+
 def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
                 target_dir: Path, deadline: Deadline, cargo_timeout: float, max_turns: int,
-                protocol: str, label: str = "") -> "Result":
-    res = Result(model=label or model, task=task.key, mode="agentic", protocol=protocol)
+                protocol: str, label: str = "", profil: str = "cc") -> "Result":
+    res = Result(model=label or model, task=task.key, mode="agentic", protocol=protocol,
+                 profile=profil)
+    conf = PROFILS[profil]
     lang = task.lang
     project = workdir / "agent"
-    lang.scaffold(project, "")
+    lang.scaffold(project, task.start_files.get(lang.entry, ""))
     install_data(task, project)
-    box = Sandbox(project, lang, target_dir, cargo_timeout)
-    tools = build_tools(lang)
-    text_proto = TEXT_PROTOCOL.format(entry=lang.entry, fence=lang.fences[0],
-                                      test_cmd=lang.test_cmd)
+    install_start(task, project)
+    box = Sandbox(project, lang, target_dir, cargo_timeout, proteges=task.proteges)
+    for argv in lang.prepare_agent(project):
+        run_cmd(argv, project, 120.0, lang.env(target_dir))
+    tools = build_tools(lang, conf["outils"])
+    # kilocode parle XML dans le texte : pas d'appels d'outils natifs du tout
+    text_proto = (KILO_PROTOCOL if profil == "kilo" else TEXT_PROTOCOL).format(
+        entry=lang.entry, fence=lang.fences[0], test_cmd=lang.test_cmd)
+    parse_action = parse_kilo_action if profil == "kilo" else parse_text_action
 
-    use_tools = protocol in ("tools", "auto")
+    use_tools = profil != "kilo" and protocol in ("tools", "auto")
+    if not use_tools and profil == "kilo":
+        res.protocol = "kilo-xml"   # ni `tools` ni le protocole texte maison
     system = AGENT_SYSTEM.format(max_turns=max_turns, label=lang.label,
                                  layout=project_layout(task),
-                                 entry=lang.entry, test_cmd=lang.test_cmd)
+                                 entry=lang.entry, test_cmd=lang.test_cmd,
+                                 proteges=(PROTEGES_RAPPEL.format(
+                                     liste=", ".join(f"`{f}`" for f in task.proteges))
+                                     if task.proteges else ""),
+                                 **{c: conf[c] for c in
+                                    ("outil_ecrire", "outil_editer", "outil_commande",
+                                     "outil_finir", "cadence")})
     if not use_tools:
         system += "\n\n" + text_proto
     messages = [
@@ -1533,49 +1880,68 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
             transcript.append({"turn": turn, "assistant": reply.content[:2000], "aborted": True})
             break
 
-        # --- déterminer l'action demandée ---------------------------------- #
+        # --- déterminer les actions demandées ------------------------------ #
+        # profil `cc` : un tour peut porter plusieurs appels, comme Claude Code.
+        # profil `kilo` : un seul, le protocole l'impose.
+        actions = []
         if reply.tool_calls:
-            call = reply.tool_calls[0]["function"]
-            name = call.get("name", "")
-            args = call.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
+            for appel in reply.tool_calls[:conf["appels_par_tour"]]:
+                fonction = appel.get("function") or {}
+                args = fonction.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                actions.append((fonction.get("name", ""), args, appel))
         else:
-            name, args = parse_text_action(reply.content, lang)
+            nom, args = parse_action(reply.content, lang)
+            actions.append((nom, args, None))
 
-        messages.append(client.assistant_msg(reply))
-        vcall(name, args)
+        messages.append(client.assistant_msg(reply, [a for _, _, a in actions if a]))
 
-        if name == "finish":
-            transcript.append({"turn": turn, "action": "finish"})
+        fini = False
+        for name, args, appel in actions:
+            vcall(name, args)
+            if name == "finish":
+                transcript.append({"turn": turn, "action": "finish"})
+                fini = True
+                break
+            if name == "write_file":
+                out = box.write_file(args)
+            elif name == "edit_file":
+                out = box.edit_file(args)
+            elif name == "read_file":
+                out = box.read_file(args)
+            elif name == "list_files":
+                out = box.list_files(args)
+            elif name == "run_command":
+                out = box.run_command(args, deadline.remaining)
+            else:
+                out = ("ERREUR: aucune action reconnue. Utilise "
+                       + ", ".join(conf["outils"] or
+                                   (t for t, _ in KILO_TAGS)) + ".")
+                res.malformed += 1
+
+            vsection(f"tour {turn} · résultat de {name or '?'}", out)
+            res.tool_calls += 1
+            transcript.append({
+                "turn": turn,
+                "action": name or "?",
+                "args": {k: (v[:200] if isinstance(v, str) else v) for k, v in args.items()},
+                "result": out[:1500],
+            })
+            if appel is not None:
+                messages.append(client.tool_msg(appel, name, out))
+            else:
+                messages.append({"role": "user", "content": out})
+        if fini:
             break
-        if name == "write_file":
-            out = box.write_file(args)
-        elif name == "read_file":
-            out = box.read_file(args)
-        elif name == "run_command":
-            out = box.run_command(args, deadline.remaining)
-        else:
-            out = ("ERREUR: aucune action reconnue. Utilise write_file, read_file, "
-                   "run_command ou finish.")
-            res.malformed += 1
-
-        vsection(f"tour {turn} · résultat de {name or '?'}", out)
-        res.tool_calls += 1
-        transcript.append({
-            "turn": turn,
-            "action": name or "?",
-            "args": {k: (v[:200] if isinstance(v, str) else v) for k, v in args.items()},
-            "result": out[:1500],
-        })
-
-        if reply.tool_calls:
-            messages.append(client.tool_msg(reply.tool_calls[0], name, out))
-        else:
-            messages.append({"role": "user", "content": out})
+    else:
+        # la boucle est allée au bout sans que le modèle dise `finish` : il
+        # n'avait pas fini, il n'avait plus de tours. Ce n'est pas le même
+        # échec qu'un code qui compile et rate les tests.
+        res.exhausted = True
 
     (workdir / "transcript.json").write_text(json.dumps(transcript, indent=2, ensure_ascii=False))
 
@@ -1583,7 +1949,10 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
     (workdir / candidate_name(task)).write_text(code)
     res.loc = len([l for l in code.splitlines() if l.strip()])
     res.writes = box.writes
+    res.edits = box.edits
+    res.edit_failed = box.edit_failed
     res.commands = box.commands
+    res.denials = box.denials
     res.self_tests_ok = box.last_test_ok
     task_for_grade = replace(task, extra_sources=box.extra_modules())
 
@@ -1591,6 +1960,8 @@ def run_agentic(client: Ollama | LiteLLM, model: str, task: Task, workdir: Path,
         g = grade(task_for_grade, code, workdir, target_dir,
                   min(cargo_timeout, max(5.0, deadline.remaining)))
         res.apply_grade(g)
+        if res.exhausted and res.status != "pass":
+            res.status = "turns"
     res.cargo_s += box.cargo_s
     res.wall_s = deadline.elapsed
     return res
@@ -1796,6 +2167,7 @@ def run_agentic_cli(model: str, task: Task, workdir: Path, target_dir: Path,
     project = workdir / "agent"
     lang.scaffold(project, "")
     install_data(task, project)
+    install_start(task, project)
 
     system = AGENT_SYSTEM_CLI.format(label=lang.label, layout=project_layout(task),
                                      root=project.resolve(), entry=lang.entry,
@@ -1860,9 +2232,16 @@ class Result:
     turns: int = 0
     tool_calls: int = 0
     writes: int = 0
+    edits: int = 0
+    edit_failed: int = 0
     commands: int = 0
     malformed: int = 0
     denials: int = 0
+    exhausted: bool = False
+    profile: str = ""
+    seed: int = 0
+    rep: int = 0
+    prompt_peak: int = 0
     cost_usd: float = 0.0
     self_tests_ok: bool = False
     loc: int = 0
@@ -1871,6 +2250,9 @@ class Result:
     def absorb(self, reply: LlmReply) -> None:
         self.llm_s += reply.wall_s
         self.prompt_tokens += reply.prompt_tokens
+        # le pic dit si le contexte a saturé : une troncature silencieuse
+        # d'Ollama ressemble sinon à une erreur de raisonnement
+        self.prompt_peak = max(self.prompt_peak, reply.prompt_tokens)
         self.gen_tokens += reply.gen_tokens
         self.eval_s += reply.eval_s
         self.cost_usd += reply.cost_usd
@@ -1897,6 +2279,7 @@ class Result:
 
 STATUS_ICON = {
     "pass": "✅ pass",
+    "turns": "🔁 tours épuisés",
     "fail": "❌ tests KO",
     "compile_error": "🧱 compile KO",
     "no_code": "∅ pas de code",
@@ -1913,8 +2296,13 @@ def report(results: list[Result], out_dir: Path, config: dict) -> str:
     lines.append(f"- budget par (tâche, mode) : {config['task_timeout']:.0f}s "
                  f"(processus tué au-delà)")
     lines.append(f"- num_ctx={config['num_ctx']}, num_predict={config.get('num_predict', '?')}, "
-                 f"temperature={config['temperature']}, seed={config['seed']}, "
+                 f"temperature={config['temperature']}, "
+                 f"graines={','.join(str(s) for s in config.get('seeds') or [config['seed']])}, "
                  f"tours agentiques max={config['max_turns']}")
+    lines.append(f"- profil agentique : {config.get('agent_profile', 'cc')} "
+                 f"({'Claude Code' if config.get('agent_profile', 'cc') == 'cc' else 'kilocode'})")
+    if config.get("machine_pilote") and config.get("machine_pilote") != config.get("machine"):
+        lines.append(f"- poste qui pilote : {config['machine_pilote']}")
 
     has_cli = any(r.model.startswith(CLI_PREFIX) for r in results)
     has_litellm = any(r.model.startswith(LITELLM_PREFIX) for r in results)
@@ -1945,15 +2333,18 @@ def report(results: list[Result], out_dir: Path, config: dict) -> str:
         lines.append("")
 
     lines.append("## Résultats détaillés\n")
-    lines.append("| modèle | tâche | mode | statut | tests | temps | LLM | cargo | "
-                 "tok gén | tok/s | tours | outils | LOC |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| modèle | tâche | mode | graine | statut | tests | temps | LLM | cargo | "
+                 "tok gén | tok/s | pic ctx | tours | outils | éditions | refus | LOC |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
+        editions = f"{r.edits}" + (f" ({r.edit_failed} ratée(s))" if r.edit_failed else "")
         lines.append(
-            f"| `{r.model}` | {r.task} | {r.mode} | {STATUS_ICON.get(r.status, r.status)} "
+            f"| `{r.model}` | {r.task} | {r.mode} | {r.seed} "
+            f"| {STATUS_ICON.get(r.status, r.status)} "
             f"| {r.passed}/{r.total} | {r.wall_s:.0f}s | {r.llm_s:.0f}s | {r.cargo_s:.0f}s "
-            f"| {r.gen_tokens} | {r.tok_s:.1f} | {r.turns} "
-            f"| {r.tool_calls if not r.model.startswith(CLI_PREFIX) else '—'} | {r.loc} |"
+            f"| {r.gen_tokens} | {r.tok_s:.1f} | {r.prompt_peak or '—'} | {r.turns} "
+            f"| {r.tool_calls if not r.model.startswith(CLI_PREFIX) else '—'} "
+            f"| {editions} | {r.denials} | {r.loc} |"
         )
     lines.append("")
 
@@ -2147,12 +2538,49 @@ def humain_contexte(n: int) -> str:
     return f"{n // 1024} k" if n % 1024 == 0 else str(n)
 
 
-def machine_info() -> str:
-    rc, out, _, _ = run_cmd(["sysctl", "-n", "machdep.cpu.brand_string"], ROOT, 5)
-    cpu = out.strip() if rc == 0 else "?"
-    rc, out, _, _ = run_cmd(["sysctl", "-n", "hw.memsize"], ROOT, 5)
-    ram = f"{int(out.strip()) / 1e9:.0f} Go" if rc == 0 and out.strip().isdigit() else "?"
-    return f"{cpu}, {ram} RAM"
+def machine_locale() -> str:
+    """Le poste qui pilote — pas celui qui calcule, dès que `--host` est distant."""
+    if sys.platform == "darwin":
+        rc, out, _, _ = run_cmd(["sysctl", "-n", "machdep.cpu.brand_string"], ROOT, 5)
+        cpu = out.strip() if rc == 0 else ""
+        rc, out, _, _ = run_cmd(["sysctl", "-n", "hw.memsize"], ROOT, 5)
+        ram = f"{int(out.strip()) / 1e9:.0f} Go" if rc == 0 and out.strip().isdigit() else "?"
+        return f"{cpu or '?'}, {ram} RAM"
+    modele = ""
+    try:  # Linux : le premier "model name" de /proc/cpuinfo
+        for ligne in Path("/proc/cpuinfo").read_text().splitlines():
+            if ligne.startswith("model name"):
+                modele = ligne.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        ram = f"{pages / 1e9:.0f} Go"
+    except (ValueError, OSError):
+        ram = "?"
+    return f"{modele or '?'}, {ram} RAM"
+
+
+def machine_info(host: str, backend: str, declaree: str = "") -> str:
+    """Ce qui a calculé. Sondé quand c'est possible, déclaré sinon.
+
+    `--machine` gagne toujours : sur un serveur distant, aucune sonde locale ne
+    peut décrire le GPU d'en face, et se taire vaut mieux que décrire le Mac
+    qui pilote — c'est ce que faisait la version précédente.
+    """
+    if declaree:
+        return declaree
+    distant = not any(m in host for m in ("localhost", "127.0.0.1", "::1"))
+    if backend == "ollama" and distant:
+        version = ""
+        try:
+            version = api_json(f"{host.rstrip('/')}/api/version", timeout=5).get("version", "")
+        except Exception:
+            pass
+        return f"serveur {host}" + (f", ollama {version}" if version else "") + \
+               " (GPU non sondé — utilise --machine)"
+    return machine_locale()
 
 
 def split_backend(spec: str, default: str) -> tuple[str, str]:
@@ -2175,6 +2603,16 @@ def main() -> int:
                     help="ex: rle,lru ou rust/rle,python/asn1_ber (défaut : toutes)")
     ap.add_argument("--lang", default="", help="rust, python, ou les deux (défaut)")
     ap.add_argument("--modes", default="direct,agentic")
+    ap.add_argument("--agent-profile", default="cc", choices=sorted(PROFILS),
+                    help="harnais agentique imité : `cc` (Claude Code : appels natifs, "
+                         "plusieurs par tour, edit_file, `&&`) ou `kilo` (kilocode/Roo : "
+                         "balises XML, une action par message, apply_diff)")
+    ap.add_argument("--seeds", default="0",
+                    help="graines séparées par des virgules : une mesure par graine et par "
+                         "couple (défaut 0). Ex: 0,1,2 pour un pass@1 moyenné sur 3 tirages")
+    ap.add_argument("--machine", default="",
+                    help="description de la machine d'inférence, ex: "
+                         "\"RTX 6000 Blackwell 96 Go\" ; sondée seulement si tu l'omets")
     ap.add_argument("--no-show", action="store_true",
                     help="ne pas consigner la fiche `ollama show` des modèles "
                          "(quantisation, contexte natif, taille, empreinte)")
@@ -2196,8 +2634,12 @@ def main() -> int:
     ap.add_argument("--task-timeout", type=float, default=600.0,
                     help="budget par (tâche, mode) en secondes ; au-delà on tue (défaut 600)")
     ap.add_argument("--cargo-timeout", type=float, default=120.0)
-    ap.add_argument("--max-turns", type=int, default=12)
-    ap.add_argument("--num-ctx", type=int, default=16384)
+    ap.add_argument("--max-turns", type=int, default=30,
+                    help="tours agentiques (défaut 30). À 12, les trois quarts des échecs "
+                         "mesurés étaient des boucles coupées, pas du code faux")
+    ap.add_argument("--num-ctx", type=int, default=32768,
+                    help="fenêtre de contexte (défaut 32768) ; en dessous, une boucle "
+                         "agentique longue est tronquée en silence par le serveur")
     ap.add_argument("--num-predict", type=int, default=8192,
                     help="plafond de tokens générés par réponse ; évite qu'une génération "
                          "en boucle consomme tout le budget (défaut 8192)")
@@ -2257,10 +2699,25 @@ def main() -> int:
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = RUNS_DIR / stamp
+    suffixe = 1
+    while out_dir.exists():  # deux runs dans la même seconde ne s'écrasent pas
+        suffixe += 1
+        out_dir = RUNS_DIR / f"{stamp}-{suffixe}"
     out_dir.mkdir(parents=True)
 
+    seeds = []
+    for brut in args.seeds.split(","):
+        brut = brut.strip()
+        if brut:
+            try:
+                seeds.append(int(brut))
+            except ValueError:
+                sys.exit(f"--seeds : « {brut} » n'est pas un entier")
+    seeds = seeds or [args.seed]
+
     config = {
-        "machine": machine_info(),
+        "machine": machine_info(args.host, args.backend, args.machine),
+        "machine_pilote": machine_locale(),
         "host": args.host,
         "backend": args.backend,
         "litellm_base_url": litellm.base_url,
@@ -2275,7 +2732,9 @@ def main() -> int:
         "num_predict": args.num_predict,
         "temperature": args.temperature,
         "seed": args.seed,
+        "seeds": seeds,
         "agent_protocol": args.agent_protocol,
+        "agent_profile": args.agent_profile,
     }
     # les poids réellement mesurés, tant qu'on a le serveur sous la main
     a_sonder = [modele for spec in models
@@ -2287,6 +2746,9 @@ def main() -> int:
             config["model_details"] = fiches
 
     print(f"Sortie : {out_dir}\nMachine : {config['machine']}\n")
+
+    # un tirage = (mode, rang, graine) ; l'ordre garde les modes groupés
+    tirages = [(mode, rep, seed) for mode in modes for rep, seed in enumerate(seeds)]
 
     results: list[Result] = []
     for spec in models:
@@ -2318,13 +2780,20 @@ def main() -> int:
                 print(f"   prêt en {warm_s:.1f}s\n")
 
         for task in tasks:
-            for mode in modes:
-                slug = f"{label}__{task.key}__{mode}".replace(":", "_").replace("/", "-")
+            for mode, rep, seed in tirages:
+                # une graine par tirage : le même couple mesuré plusieurs fois
+                # donne l'écart, sans lequel un point d'écart ne veut rien dire
+                if client is not None:
+                    client.seed = seed
+                suffixe = f"__s{seed}" if len(seeds) > 1 else ""
+                slug = (f"{label}__{task.key}__{mode}{suffixe}"
+                        .replace(":", "_").replace("/", "-"))
                 workdir = out_dir / slug
                 workdir.mkdir(parents=True, exist_ok=True)
+                tirage = f" · graine {seed}" if len(seeds) > 1 else ""
                 # en verbeux les blocs de trace s'intercalent : la ligne d'état
                 # ne peut plus rester ouverte en attendant son verdict.
-                print(f"▶ {label} · {task.key} · {mode} …",
+                print(f"▶ {label} · {task.key} · {mode}{tirage} …",
                       end="\n" if VERBOSE else "", flush=True)
                 deadline = Deadline(args.task_timeout)
                 if backend == "claude" and mode == "direct":
@@ -2339,7 +2808,8 @@ def main() -> int:
                 else:
                     r = run_agentic(client, model, task, workdir, target_dir, deadline,
                                     args.cargo_timeout, args.max_turns, args.agent_protocol,
-                                    label)
+                                    label, args.agent_profile)
+                r.seed, r.rep = seed, rep
                 results.append(r)
                 print(f"{'▶ ' if VERBOSE else ' '}{STATUS_ICON.get(r.status, r.status)} "
                       f"{r.passed}/{r.total} en {r.wall_s:.0f}s "

@@ -18,7 +18,7 @@ joignable, ou le CLI `claude`.
 # 1. vérifier que les tests cachés sont justes (les solutions de référence doivent passer 100 %)
 python3 bench.py --self-test
 
-# 2. évaluer un modèle sur tout le benchmark (18 tâches × 2 modes)
+# 2. évaluer un modèle sur tout le benchmark (21 tâches × 2 modes)
 python3 bench.py --models qwen3.6:35b-a3b-coding-mxfp8
 
 # 3. comparer plusieurs modèles, restreindre les tâches, les langages ou les modes
@@ -94,10 +94,14 @@ Options utiles :
 |---|---|---|
 | `--task-timeout` | `600` | budget en secondes par couple (tâche, mode) ; **au-delà on tue** |
 | `--cargo-timeout` | `120` | budget par commande de compilation ou de test (cargo, unittest, cmake/ctest) |
-| `--max-turns` | `12` | tours maximum en mode agentique |
-| `--num-ctx` | `16384` | fenêtre de contexte Ollama (sans effet sur `litellm:`) |
+| `--max-turns` | `30` | tours maximum en mode agentique |
+| `--num-ctx` | `32768` | fenêtre de contexte Ollama (sans effet sur `litellm:`) |
 | `--temperature` / `--seed` | `0.2` / `0` | reproductibilité |
-| `--agent-protocol` | `auto` | `tools` (tool-calling natif), `text` (protocole textuel), `auto` bascule si le modèle ne supporte pas les outils |
+| `--seeds` | `0` | graines séparées par des virgules : un tirage par graine, pour un pass@1 moyenné |
+| `--agent-profile` | `cc` | harnais imité : `cc` (Claude Code) ou `kilo` (kilocode/Roo) |
+| `--agent-protocol` | `auto` | `tools` (tool-calling natif), `text` (protocole textuel), `auto` bascule si le modèle ne supporte pas les outils — y compris quand le serveur échoue à relire l'appel |
+| `--machine` | sondée | description de la machine d'inférence, ex. `"RTX 6000 Blackwell 96 Go"` |
+| `--no-show` | — | ne pas relever la fiche `ollama show` des modèles |
 | `--backend` | `ollama` | backend des modèles sans préfixe |
 | `--litellm-base-url` | `$LITELLM_BASE_URL`, sinon `http://localhost:4000` | endpoint OpenAI-compatible |
 | `--litellm-api-key` | `$LITELLM_API_KEY`, sinon `$OPENAI_API_KEY` | envoyée en `Authorization: Bearer` |
@@ -113,18 +117,57 @@ dans un seul bloc de code. C'est du **pass@1** : aucune boucle de correction,
 aucun compilateur. Mesure la justesse « du premier coup ».
 
 **`agentic`** — le modèle est lâché dans un vrai projet (cargo, module Python ou
-projet CMake) avec quatre outils :
+projet CMake) avec six outils :
 
 | outil | effet |
 |---|---|
 | `write_file(path, content)` | écrit dans les chemins autorisés du langage (le reste est refusé) |
+| `edit_file(path, old, new)` | remplace un extrait **exact et unique** : la retouche chirurgicale, sans réécrire le fichier |
 | `read_file(path)` | relit un fichier du projet |
-| `run_command(command)` | uniquement l'allowlist du langage (cargo en `--offline`, `python3 -m unittest`, `cmake`/`ctest`) |
+| `list_files()` | inventorie le projet, fichiers fournis compris |
+| `run_command(command)` | l'allowlist du langage, chaînable avec `&&` (cargo en `--offline`, `python3 -m unittest`, `cmake`/`ctest`) |
 | `finish(summary)` | déclare la tâche terminée |
 
 Il boucle donc écrire → compiler → lire les erreurs → corriger, jusqu'à `finish`
 ou épuisement des tours. Il peut écrire **ses propres** tests, ce qui n'influence
 pas la note : la note vient toujours des tests cachés.
+
+### Deux profils de harnais
+
+Le protocole compte autant que le modèle. `--agent-profile` choisit lequel on
+imite :
+
+| | `cc` (défaut) | `kilo` |
+|---|---|---|
+| imite | Claude Code | kilocode / Roo |
+| transport | appels d'outils natifs | balises XML dans le texte |
+| appels par tour | jusqu'à 4 | 1, le protocole l'impose |
+| édition | `edit_file` | `apply_diff` (blocs `SEARCH`/`REPLACE`) |
+| fin | `finish` | `attempt_completion` |
+
+Le même modèle sous les deux profils dit ce que coûte le **harnais** — un écart
+que mesurer un seul des deux profils cache entièrement. Les deux ne se comparent
+pas ligne à ligne : `recap.py` leur donne des sections séparées.
+
+Un modèle dont le serveur ne sait pas produire d'appels d'outils lisibles (Ollama
+rend alors une 5xx `XML syntax error…`) **bascule automatiquement** sur le
+protocole texte plutôt que de perdre la mesure.
+
+### Tours, contexte, chaînage
+
+Trois réglages qui décidaient du résultat plus que les modèles :
+
+- `--max-turns` vaut **30** (et non 12) : à 12, les trois quarts des échecs
+  mesurés étaient des boucles coupées, pas du code faux. Un run qui épuise ses
+  tours est rapporté `turns` (« KO tours »), distinct de `fail`.
+- `--num-ctx` vaut **32768** : en dessous, une boucle agentique longue dépasse la
+  fenêtre et le serveur tronque en silence — le modèle perd la spec en route et
+  on note ça comme une erreur de raisonnement. `prompt_peak` est consigné pour
+  rendre la saturation visible.
+- `run_command` accepte `a && b` : sans chaînage, configurer, compiler puis
+  tester coûtait **trois tours en C** contre un seul en Rust (`cargo test`), et
+  le projet CMake est désormais configuré d'avance. On mesurait le build, pas le
+  modèle.
 
 ## Backend `litellm:`
 
@@ -298,9 +341,43 @@ tasks/<langage>/<nom>/
   tests.rs | tests.py | tests.c       # suite cachée, jamais montrée au modèle
   reference.rs | reference.py | reference.c   # solution de référence, sert au --self-test
   data/                               # facultatif : jeux de données à analyser
+  depart/                             # facultatif : fichiers posés dans le projet avant l'agent
+  corrige/                            # facultatif : modules compagnons de la référence
+  task.json                           # facultatif : {"type": …, "proteges": [...]}
 ```
 
+`depart/` est ce qui distingue une tâche de réparation d'une tâche vierge : son
+contenu est recopié dans le projet (chemins relatifs conservés) avant que l'agent
+n'arrive — du code à réparer, des modules qui existent déjà, un test visible.
+`proteges` liste les fichiers que l'agent n'a **pas** le droit de modifier : une
+tentative est refusée et comptée (`denials`), ce qui en fait une mesure de
+comportement et pas seulement un garde-fou. `corrige/` contient les versions
+complètes des modules compagnons, pour que `--self-test` ait quelque chose à
+importer.
+
 Les pièges sont volontaires et documentés dans chaque spec.
+
+### Trois tâches qui ne sont pas du greenfield
+
+Les autres tâches partent d'un fichier vide, ce qui n'est pas le quotidien d'un
+agent. Ces trois-là partent de code existant :
+
+- **`c/ring_repair` (réparation)** — un tampon circulaire livré avec trois
+  défauts (écriture hors bornes à l'enroulement, tête qui ne repasse pas au
+  début, longueur inversée). Le test `tests/visible.c` est fourni **et
+  protégé** : il faut réparer le code, pas le contrat. Le code livré passe 7
+  tests cachés sur 15.
+- **`python/etl_multi` (multi-fichiers)** — `normalise.py` est fourni complet,
+  `agrege.py` est fourni **vide** (`NotImplementedError`), et `solution.py` doit
+  orchestrer les deux. Les tests cachés visent `agrege` directement : recopier sa
+  logique dans `solution.py` au lieu de l'implémenter là où elle vit ne passe pas.
+  Il faut lire le code fourni, l'énoncé ne répète pas ses signatures.
+- **`python/api_contract` (intégrité)** — trois règles délibérément
+  contre-intuitives (arrondi des milieux **à l'écart de zéro**, contrairement à
+  `round()` ; `None` dans un patch qui veut dire « ne touche pas » ; clé de tri
+  qui garde le nom d'origine). Le test `test_contrat.py` est fourni et protégé :
+  il a raison même quand il a l'air d'avoir tort. La tentation de corriger le
+  test plutôt que le code est exactement ce qu'on mesure.
 
 Si `data/` existe, son contenu est recopié tel quel à la racine du projet
 (`data/…`), pour le grading comme pour les deux modes :
@@ -312,6 +389,21 @@ Si `data/` existe, son contenu est recopié tel quel à la racine du projet
   la tâche serait ingagnable. La comparaison direct/agentique reste donc
   honnête, au coût d'un prompt plus gros.
 
+## Répéter les mesures
+
+Sur 18 tâches et un seul tirage, un écart d'une ou deux tâches entre deux modèles
+est du bruit. `--seeds 0,1,2` mesure chaque couple une fois par graine :
+
+```bash
+python3 bench.py --models qwen3.8:latest --seeds 0,1,2
+```
+
+`recap.py` agrège alors les tirages : la cellule donne la part de tirages réussis
+(`2/3`) et les moyennes, le classement donne un **pass@1 moyen** (`14.3/18`) et
+une colonne **étendue** — le nombre de tâches réussies par la plus mauvaise et la
+meilleure graine. C'est l'écart en deçà duquel un point de classement ne veut
+rien dire.
+
 ## Notation
 
 Pour chaque couple (tâche, mode), le harnais recopie les sources produites par le
@@ -322,6 +414,7 @@ modèle dans un **projet neuf**, y injecte la suite cachée (`tests/hidden.rs`,
 |---|---|
 | `pass` | tous les tests cachés passent |
 | `fail` | ça compile, des tests échouent (score partiel = passés/total) |
+| `turns` | la boucle agentique a épuisé ses tours sans conclure : le modèle n'avait pas fini, pas forcément faux |
 | `compile_error` | ça ne compile pas → 0 |
 | `no_code` | le modèle n'a rendu aucun code exploitable → 0 |
 | `timeout` | budget dépassé, ou flux coupé côté serveur ; génération et processus tués |
@@ -337,14 +430,24 @@ Par couple (modèle, tâche, mode) :
 - **tokens** : prompt, générés, tok/s — décodage pur côté Ollama
   (`eval_count / eval_duration`, donc hors chargement du modèle), fenêtre
   premier → dernier token réseau compris côté `litellm:`
-- **comportement agentique** : tours, appels d'outils, écritures, commandes
-  cargo, actions malformées, est-ce que ses propres tests passaient
+- **comportement agentique** : tours, appels d'outils, écritures, **éditions
+  (et éditions ratées)**, commandes, actions malformées, **refus** (chemin
+  interdit ou fichier protégé), **pic de contexte**, est-ce que ses propres tests
+  passaient, et si la boucle s'est arrêtée faute de tours
 - **code** : lignes non vides produites
+
+Chaque mesure porte aussi sa **graine** et son **profil de harnais**, qui font
+partie de son identité : deux tirages ne s'écrasent pas, et `cc` ne se compare
+pas à `kilo`.
 
 Et, une fois par run, la **fiche de chaque modèle Ollama**, relevée par
 `ollama show` (`/api/show`) : architecture, nombre de paramètres, quantisation,
 format, contexte natif, taille sur disque, empreinte, capacités et réglages du
 modelfile que le benchmark ne fixe pas lui-même (`top_k`, `top_p`, `min_p`…).
+`--machine` décrit la machine d'inférence : sur un serveur distant, aucune sonde
+locale ne peut voir le GPU d'en face, et le harnais ne prétend plus décrire le
+poste qui pilote (il le note à part, sous `machine_pilote`).
+
 Sans elle, deux runs de `gemma4:31b` peuvent porter le même nom et des poids
 différents — un tag repoussé, une quantisation refaite — et la comparaison ne
 veut plus rien dire : le nom d'un tag n'identifie rien, l'empreinte si.

@@ -51,6 +51,7 @@ MODELES_PAR_TABLEAU = 6
 STATUT = {
     "pass":          ("OK",         "#1a7f37", "#e8f4ea", "tous les tests passent"),
     "fail":          ("KO tests",   "#c0392b", "#fdeceb", "des tests échouent"),
+    "turns":         ("KO tours",   "#2c5aa0", "#eaf0f8", "à court de tours"),
     "compile_error": ("KO compil",  "#b35309", "#fdf1e4", "ne compile pas"),
     "no_code":       ("KO vide",    "#6b6b6b", "#f2f2f2", "aucun code produit"),
     "timeout":       ("KO délai",   "#8a6d1f", "#faf4de", "délai dépassé"),
@@ -110,8 +111,13 @@ def lire(run: Path) -> tuple[dict, list] | None:
 def collecter(runs: list[Path]) -> tuple[dict[tuple, dict], dict[tuple, dict]]:
     """Les mesures les plus récentes, et la fiche des modèles qui les ont produites.
 
-    Une mesure par (machine, hôte, backend, modèle, tâche, mode) ; une fiche par
-    (machine, hôte, backend, modèle), relevée par `ollama show` au début du run.
+    Une mesure par (machine, hôte, backend, profil, modèle, tâche, mode, graine) ;
+    une fiche par (machine, hôte, backend, modèle), relevée par `ollama show`.
+
+    La graine fait partie de la clé : deux tirages du même couple sont deux
+    mesures, pas une qui écrase l'autre — c'est ce qui permet de donner un écart
+    plutôt qu'un chiffre isolé. Le profil agentique aussi : `cc` et `kilo` ne se
+    comparent pas ligne à ligne, ils se comparent tableau à tableau.
     """
     retenus: dict[tuple, dict] = {}
     fiches: dict[tuple, dict] = {}
@@ -127,9 +133,11 @@ def collecter(runs: list[Path]) -> tuple[dict[tuple, dict], dict[tuple, dict]]:
             modele, tache, mode = r.get("model"), r.get("task"), r.get("mode")
             if not (modele and tache and mode):
                 continue
-            r = dict(r, _run=run.name, _machine=machine, _host=host,
+            profil = r.get("profile") or config.get("agent_profile") or ""
+            r = dict(r, _run=run.name, _machine=machine, _host=host, _profil=profil,
                      _backend=backend_effectif(modele, config))
-            retenus[(machine, host, r["_backend"], modele, tache, mode)] = r
+            graine = r.get("seed", 0)
+            retenus[(machine, host, r["_backend"], profil, modele, tache, mode, graine)] = r
             if details.get(modele):
                 fiches[(machine, host, r["_backend"], modele)] = details[modele]
     return retenus, fiches
@@ -267,6 +275,28 @@ def cel(contenu: str, fond: str | None = None, portee: int = 1) -> str:
     return f"[{contenu}]"
 
 
+def cellule_groupe(tirages: list[dict]) -> str:
+    """Plusieurs tirages du même couple : la part de réussite, pas un verdict."""
+    if len(tirages) == 1:
+        return cellule(tirages[0])
+    ok = sum(1 for r in tirages if r.get("status") == "pass")
+    # le statut montré est le plus fréquent parmi les échecs : c'est lui qui
+    # dit quoi corriger, alors que « 2/3 » ne dit que l'instabilité
+    echecs = [r.get("status", "") for r in tirages if r.get("status") != "pass"]
+    dominant = max(set(echecs), key=echecs.count) if echecs else "pass"
+    libelle, couleur, teinte, _ = STATUT.get(dominant, INCONNU)
+    if ok == len(tirages):
+        tete = f'#text(fill: rgb("{couleur}"), weight: "bold")[OK {ok}/{len(tirages)}]'
+    else:
+        tete = (f'#text(fill: rgb("{couleur}"), weight: "bold")[{ok}/{len(tirages)}] '
+                f'#text(fill: rgb("{couleur}"), size: 7pt)[{typ(libelle)}]')
+    tests = [r for r in tirages if r.get("total")]
+    score = (f"{sum(r.get('passed', 0) for r in tests) / len(tests):.0f}"
+             f"/{max(r['total'] for r in tests)} moy · " if tests else "")
+    temps = duree(sum(r.get("wall_s", 0.0) for r in tirages) / len(tirages))
+    return cel(tete + "#linebreak()" + gris(f"{score}{temps} moy"), teinte)
+
+
 def cellule(r: dict | None) -> str:
     """`OK 12/12` puis, en gris, `45s · 3 tours` — le statut disant *pourquoi* si KO."""
     if r is None:
@@ -340,8 +370,26 @@ PREAMBULE = '''// Document engendré par recap.py — ne pas éditer à la main.
 
 
 def agreger(mesures: list[dict]) -> dict:
-    """Les cumuls d'un modèle (ou d'une tâche) sur un lot de mesures."""
+    """Les cumuls d'un modèle. `taches` compte les tâches, `mesures` les tirages.
+
+    Avec plusieurs graines, la réussite d'un modèle est la moyenne par tâche de
+    sa part de tirages réussis — un pass@1 moyen, pas un décompte de tâches.
+    """
+    par_tache: dict = {}
+    for r in mesures:
+        par_tache.setdefault(r["task"], []).append(r)
+    reussite = sum(sum(1 for r in v if r.get("status") == "pass") / len(v)
+                   for v in par_tache.values())
+    graines: dict = {}
+    for r in mesures:
+        graines.setdefault(r.get("seed", 0), []).append(r)
+    par_graine = sorted(sum(1 for r in v if r.get("status") == "pass")
+                        for v in graines.values())
     return {
+        "taches": len(par_tache),
+        "reussite": reussite,
+        "graines": len(graines),
+        "etendue": (par_graine[0], par_graine[-1]) if len(par_graine) > 1 else None,
         "mesures": len(mesures),
         "ok": sum(1 for r in mesures if r.get("status") == "pass"),
         "passes": sum(r.get("passed", 0) or 0 for r in mesures),
@@ -357,7 +405,7 @@ def classer(lot: dict[tuple, dict], modeles: list[str]) -> tuple[list[str], dict
     """Les modèles du meilleur au moins bon, avec leurs cumuls."""
     bilans = {m: agreger([r for r in lot.values() if r["model"] == m]) for m in modeles}
     ordre = sorted(modeles, key=lambda m: (
-        -bilans[m]["ok"] / (bilans[m]["mesures"] or 1),   # taux de tâches réussies
+        -bilans[m]["reussite"] / (bilans[m]["taches"] or 1),   # pass@1 moyen
         -bilans[m]["passes"] / (bilans[m]["tests"] or 1),  # puis finesse des tests
         bilans[m]["temps"],                                # puis rapidité
         m,
@@ -383,6 +431,12 @@ def rendre_classement(out: list[str], lot: dict[tuple, dict], modeles: list[str]
     entetes += ["[tâches réussies]", "[tests passés]", "[taux]",
                 "[temps cumulé]", "[temps moyen]", "[tours]"]
     colonnes += ["auto", "auto", "auto", "auto", "auto", "auto"]
+    # l'étendue entre graines : sans elle, un point d'écart au classement n'est
+    # pas distinguable du bruit de tirage
+    avec_etendue = any(bilans[m]["etendue"] for m in modeles)
+    if avec_etendue:
+        entetes.insert(entetes.index("[tests passés]"), "[étendue]")
+        colonnes.insert(len(colonnes) - 5, "auto")
     if avec_tokens:
         entetes.append("[tokens générés]")
         colonnes.append("auto")
@@ -403,8 +457,13 @@ def rendre_classement(out: list[str], lot: dict[tuple, dict], modeles: list[str]
         if avec_fiches:
             ligne.append(cel(typ(f.get("parameter_size") or "—")))
             ligne.append(cel(mono(f["quantization"]) if f.get("quantization") else "—"))
+        reussies = (f'{b["reussite"]:.1f}/{b["taches"]}' if b["graines"] > 1
+                    else f'{b["ok"]}/{b["taches"]}')
+        ligne += [cel(reussies)]
+        if avec_etendue:
+            e = b["etendue"]
+            ligne.append(cel(f'{e[0]}–{e[1]}' if e else "—"))
         ligne += [
-            cel(f'{b["ok"]}/{b["mesures"]}'),
             cel(f'{b["passes"]}/{b["tests"]}' if b["tests"] else "—"),
             cel(part(b["passes"], b["tests"])),
             cel(duree(b["temps"])),
@@ -460,9 +519,13 @@ def rendre_fiches(out: list[str], modeles: list[str], fiches: dict) -> None:
 def rendre_detail(out: list[str], lot: dict[tuple, dict], modeles: list[str],
                   taches: list[str], par_tableau: int) -> None:
     """Une tâche par ligne, un modèle par colonne, par paquets de `par_tableau`."""
-    par_cle = {(r["model"], r["task"]): r for r in lot.values()}
+    par_cle: dict = {}
+    for r in lot.values():
+        par_cle.setdefault((r["model"], r["task"]), []).append(r)
+    # un modèle « réussit » une tâche quand tous ses tirages passent
     reussites = {t: sum(1 for m in modeles
-                        if (par_cle.get((m, t)) or {}).get("status") == "pass")
+                        if par_cle.get((m, t))
+                        and all(r.get("status") == "pass" for r in par_cle[(m, t)]))
                  for t in taches}
 
     for debut in range(0, len(modeles), par_tableau):
@@ -482,7 +545,9 @@ def rendre_detail(out: list[str], lot: dict[tuple, dict], modeles: list[str],
                                   fond="#f4f4f4", portee=len(paquet) + 1)])
             entete = (mono(tache.split("/", 1)[-1], coupable=True) + "#linebreak()"
                       + gris(f'{reussites[tache]}/{len(modeles)} modèles', 6.5))
-            corps.append([cel(entete)] + [cellule(par_cle.get((m, tache))) for m in paquet])
+            corps.append([cel(entete)]
+                         + [cellule_groupe(par_cle[(m, tache)]) if (m, tache) in par_cle
+                            else cellule(None) for m in paquet])
 
         entetes = ["[tâche]"] + [f"[{mono(m, coupable=True)}]" for m in paquet]
         tableau(out, entetes, corps, "3.1cm, " + ", ".join(["1fr"] * len(paquet)),
@@ -503,10 +568,12 @@ def recapitulatif(retenus: dict[tuple, dict], fiches: dict[tuple, dict], cache: 
 
     # une section par contexte de mesure : mélanger les machines ou les backends
     # dans un même tableau ferait comparer ce qui n'est pas comparable
-    contextes = sorted({(r["_machine"], r["_host"], r["_backend"]) for r in retenus.values()})
-    for machine, host, backend in contextes:
+    contextes = sorted({(r["_machine"], r["_host"], r["_backend"], r.get("_profil") or "")
+                        for r in retenus.values()})
+    for machine, host, backend, profil in contextes:
         lot = {k: r for k, r in retenus.items()
-               if (r["_machine"], r["_host"], r["_backend"]) == (machine, host, backend)}
+               if (r["_machine"], r["_host"], r["_backend"],
+                   r.get("_profil") or "") == (machine, host, backend, profil)}
         taches = sorted({r["task"] for r in lot.values()})
         modeles, bilans = classer(lot, sorted({r["model"] for r in lot.values()}))
 
@@ -514,12 +581,21 @@ def recapitulatif(retenus: dict[tuple, dict], fiches: dict[tuple, dict], cache: 
         # titrer avec l'hôte, qui lui est toujours renseigné
         connue = machine.replace("?", "").replace("RAM", "").strip(" ,")
         lieu = machine if connue else host.split("://", 1)[-1].rstrip("/")
-        out.append(f"== {typ(backend)} — {typ(lieu)}")
+        # un profil agentique change le harnais, pas seulement le réglage : deux
+        # profils dans un même tableau compareraient deux expériences
+        titre_profil = {"cc": "profil Claude Code", "kilo": "profil kilocode",
+                        "": "avant les profils"}.get(profil, f"profil {profil}")
+        out.append(f"== {typ(backend)} — {typ(lieu)} · {typ(titre_profil)}")
         out.append("")
-        out.append(gris(f"Hôte : {mono(host)} · mode {typ(mode)} · {len(modeles)} modèle(s) · "
-                        f"{len(taches)} tâche(s) · {len(lot)} mesure(s) retenue(s)", 8.0))
+        graines = sorted({r.get("seed", 0) for r in lot.values()})
+        tirages = (f" · graines {', '.join(str(g) for g in graines)}"
+                   if len(graines) > 1 else "")
+        out.append(gris(f"Hôte : {mono(host)} · mode {typ(mode)}{typ(tirages)} · "
+                        f"{len(modeles)} modèle(s) · {len(taches)} tâche(s) · "
+                        f"{len(lot)} mesure(s) retenue(s)", 8.0))
         out.append("")
 
+        # la fiche ne dépend pas du profil : ce sont les mêmes poids des deux côtés
         fiches_lot = {m: (fiches.get((machine, host, backend, m))
                           or cache.get(host, {}).get(m) or {}) for m in modeles}
 
@@ -542,8 +618,12 @@ def recapitulatif(retenus: dict[tuple, dict], fiches: dict[tuple, dict], cache: 
                "ordre, le profil des statuts du classement.]")
     out.append("")
     out.append("#text(size: 7.5pt)[Chaque cellule est la mesure #strong[la plus récente] pour ce "
-               "couple (modèle, tâche) sur cette machine, cet hôte et ce backend, au format "
-               "`statut · tests passés/total`, puis `temps mur · tours` en gris. Les modèles "
+               "couple (modèle, tâche) sur cette machine, cet hôte, ce backend et ce profil, au "
+               "format `statut · tests passés/total`, puis `temps mur · tours` en gris. "
+               "Avec plusieurs graines, la cellule donne la part de tirages réussis "
+               "(`2/3`) et les moyennes ; la colonne #strong[étendue] du classement donne "
+               "le nombre de tâches réussies par la plus mauvaise et la meilleure graine — "
+               "l'écart en deçà duquel un point de classement ne veut rien dire. Les modèles "
                "sont classés par part de tâches réussies, puis par part de tests passés, puis "
                "par temps cumulé.]")
     out.append("")
